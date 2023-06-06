@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "ntm-cnn-ddpg"
+version = "0.1.0"
+description = "We integrate it into a single system: NTM - Neural Turing machines, CNN - Convolutional neural network, DDPG - Deep Deterministic Policy Gradient (Q-learning method)."
+authors = ["Andrey Khomich <supremum76@gmail.com>"]
+readme = "README.md"
+packages = [{include = "ntm_cnn_ddpg"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
