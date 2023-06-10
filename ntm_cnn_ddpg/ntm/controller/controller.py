@@ -7,6 +7,7 @@ MemoryBank = tf.TensorSpec(shape=[None, None], dtype=tf.float32, name="MemoryBan
 class Controller:
     def __init__(self, memory_bank: MemoryBank) -> None:
         self._memory_bank: MemoryBank = memory_bank
+        self.memory_number_of_cells: int = memory_bank.shape[0]
         self.memory_cell_length: int = memory_bank.shape[1]
 
     def memory_bank_reading(self, w: Tensor, **kwargs) -> Tensor:
@@ -39,18 +40,41 @@ class Controller:
 
     def focusing(self, w_previous: Tensor, key_content: Tensor, interpolation_gate: Tensor, focus_factor: Tensor,
                  distribution_of_allowed_shifts: Tensor, **kwargs) -> Tensor:
-        w_next: Tensor = tf.Variable(initial_value=[0 for _ in range(w_previous.shape[0])],
-                                     shape=w_previous.shape[0], dtype=tf.dtypes.float32, **kwargs)
+
         # Focusing by Content
-        s: Tensor = tf.constant(value=0, dtype=w_next.dtype)
-        for i in range(w_next.shape[0]):
-            s[0] = 0
-            for j in range(w_next.shape[0]):
-                s.assign_add(tf.math.exp(focus_factor * self._cosine_similarity(key_content, self._memory_bank[j])))
-            w_next[i] = tf.math.exp(focus_factor * self._cosine_similarity(key_content, self._memory_bank[i])) / s
-            tf.reshape(w_next, w_next.shape[0])
+        s: Tensor = tf.vectorized_map(
+            fn=lambda x: tf.math.exp(focus_factor * self._cosine_similarity(key_content, x)),
+            elems=self._memory_bank)
+
+        w_next = tf.reshape(
+            tensor=tf.vectorized_map(fn=lambda x: tf.math.exp(focus_factor *
+                                                              self._cosine_similarity(key_content, x)) / s,
+                                     elems=self._memory_bank),
+            shape=self._memory_bank.shape[0]
+        )
+
+        # interpolation
+        one: Tensor = tf.constant(1, dtype=tf.dtypes.float32)
+        w_next = interpolation_gate * w_next + (one - interpolation_gate) * w_previous
 
         # Focusing by Location
+        # shift
+        tensor_list: list[Tensor] = []
+        for i in range(self.memory_number_of_cells):
+            s: Tensor = tf.constant(value=0, dtype=tf.dtypes.float32, shape=1)
+            for j in range(self.memory_number_of_cells):
+                s.assign_add(w_next[j] * distribution_of_allowed_shifts[(i - j) % self.memory_number_of_cells])
+            tensor_list.append(s)
+
+        w_next = tf.reshape(tensor=tf.Variable(initial_value=tensor_list,
+                                               shape=(self.memory_number_of_cells, 1),
+                                               dtype=tf.dtypes.float32, **kwargs),
+                            shape=self.memory_number_of_cells)
+
+        # final normalization (using the softmax function)
+        w_next = tf.reshape(
+            tensor=tf.keras.activations.softmax(tf.reshape(tensor=w_next, shape=(1, self.memory_number_of_cells))),
+            shape=self.memory_number_of_cells)
 
         return w_next
 
