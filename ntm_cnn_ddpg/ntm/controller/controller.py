@@ -1,9 +1,19 @@
+"""
+Controller of Neural Turing Machines.
+See NTM_
+.. _NTM: https://arxiv.org/pdf/1410.5401.pdf
+"""
+
 from typing import Callable, Sequence
 
 import tensorflow as tf
 
 Tensor = tf.Variable
-TensorFactory = Callable[[Sequence, Sequence], Tensor]  # (shape, initial_value) -> Tensor
+
+# (shape, initial_value) -> Tensor
+TensorFactory = Callable[[Sequence, Sequence], Tensor]
+
+# shape=[number of cells, cell length]
 MemoryBank = tf.TensorSpec(shape=[None, None], dtype=tf.float32, name="MemoryBank")
 
 
@@ -39,7 +49,7 @@ class Controller:
         :param e:
         :param a:
         """
-        for i in range(w.shape[0]):
+        for i in range(self.memory_number_of_cells):
             # erase
             self._memory_bank[i].assign(self._memory_bank[i] * (1 - e * w[i]))
             # add
