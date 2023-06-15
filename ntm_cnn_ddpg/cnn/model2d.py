@@ -1,4 +1,6 @@
 import tensorflow as tf
+from keras.models import Sequential as TensorFlowSequentialModel
+from keras.layers import Layer, Input, Dense, Conv2D, Flatten, MaxPooling2D, BatchNormalization
 
 Tensor = tf.Tensor
 
@@ -27,6 +29,8 @@ class Model2D:
       Увеличение размера ядра свертки и размера окна объединения позволяет постепенно увеличивать сложность выделяемых
       признаков и постепенно уменьшать чувствительность к их позиции размещения.
     """
+
+    __model: TensorFlowSequentialModel
 
     def __init__(self,
                  input_2d_shape: tuple[int, int, int],
@@ -62,8 +66,37 @@ class Model2D:
         self.rate_of_filters_increase = rate_of_filters_increase
         self.rate_of_kernel_size_increase = rate_of_kernel_size_increase
         self.rate_of_pool_size_increase = rate_of_pool_size_increase
+        self.__model = self.__model_build()
 
-    def _1d_to_2d_input_tensor(self, tensor_1d: Tensor) -> Tensor:
+    def __model_build(self) -> TensorFlowSequentialModel:
+        model = TensorFlowSequentialModel()
+
+        input_shape: tuple[int, int, int] = (self.input_2d_shape[0], self.input_2d_shape[1],
+                                             self.input_2d_shape[2] + self.input_1d_shape[0] * self.input_1d_shape[1])
+        layer: Layer = Input(shape=input_shape, dtype=tf.float32)
+        model.add(layer=layer)
+        output_shape = layer.compute_output_shape(input_shape=input_shape)
+
+        # выполняем цикл пока не получим на выходе сверточной сети тензор с формой (1, 1, filters).
+        # Пока не сведем размер 2D плоскости к точке с некоторым количеством фильтров.
+        # Применять свертку и объединение к такой точке уже не требуется.
+        while output_shape[0] == 1 and output_shape[1] == 1:
+            input_shape = output_shape
+            # строим модуль, состоящий из последовательности слоев
+            # слой нормализации
+            # слой свертки
+            # слой объединения
+            output_shape = layer.compute_output_shape(input_shape=input_shape)
+            break
+
+        # выход модели окончательно вычисляет полносвязный слой персептрона с линейной функцией активации нейронов
+        model.add(layer=Flatten())
+        model.add(layer=BatchNormalization())
+        model.add(layer=Dense(self.output_length, activation=None))
+
+        return model
+
+    def __1d_to_2d_input_tensor(self, tensor_1d: Tensor) -> Tensor:
         """
         Преобразует пакет одномерных (1D) многоканальных тензоров в
         пакет двумерных (2D) многоканальных тензоров.
