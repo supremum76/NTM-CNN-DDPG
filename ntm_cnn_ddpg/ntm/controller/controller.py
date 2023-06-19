@@ -90,5 +90,6 @@ class Controller:
         return w_next_n
 
     @staticmethod
+    @tf.function
     def _cosine_similarity(a: Tensor, b: Tensor) -> Tensor:
         return tf.reduce_sum(a * b) / (tf.norm(a) * tf.norm(b) + tf.keras.backend.epsilon())

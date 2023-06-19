@@ -156,9 +156,14 @@ class Model2D:
             shape=(batch_size, self.input_2d_shape[0], self.input_2d_shape[1], number_of_filters * length)
         )
 
-    def predict(self, input_2d: Tensor, input_1d: Tensor) -> Tensor:
+    # TODO вынести проблему приведение входа модели к определененому формату за пределы модели.
+    #       Создать абстрактный класс модели Model с абстрактными метододами
+    #       predict(self, input: Tensor, training: bool) -> Tensor
+    #       @property trainable_variables(self) -> Tensor
+    def predict(self, input_2d: Tensor, input_1d: Tensor, training: bool) -> Tensor:
         """
         Фычисление функции модели. Обучение модели при этом не выполняется.
+        :param training: Признак использования результатов вычисления для обучения модели.
         :param input_2d: 2D вход модели в виде тензора формы (HEIGHT, WEIGHT, FILTERS FOR INPUT) или,
         в случае вычисления для списка входных данных, (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR INPUT).
         Параметры HEIGHT, WEIGHT и FILTERS FOR INPUT должны соответствовать структуре модели.
@@ -181,5 +186,10 @@ class Model2D:
             _input_1d = input_1d
 
         #  преобразуем 1d тензор к 2d тензору и конкатенируем все полученные тензоры по оси фильтра
-        return self.__model(inputs=tf.concat(values=(_input_2d, self.__1d_to_2d_input_tensor(_input_1d)), axis=3))
+        return self.__model(inputs=tf.concat(values=(_input_2d, self.__1d_to_2d_input_tensor(_input_1d)), axis=3),
+                            training=training)
+
+    @property
+    def trainable_variables(self) -> Tensor:
+        return self.__model.trainable_variables
 
