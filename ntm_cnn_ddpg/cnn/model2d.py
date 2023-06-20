@@ -3,10 +3,73 @@ from keras.models import Sequential as TensorFlowSequentialModel
 from keras.layers import Layer, Input, Dense, Conv2D, Flatten, MaxPooling2D, BatchNormalization
 from tensorflow import TensorShape
 
-Tensor = tf.Tensor
+from ntm_cnn_ddpg.cnn.model import Model, Tensor
 
 
-class Model2D:
+def concat_input_tensors(input_2d: Tensor, input_1d: Tensor) -> Tensor:
+    """
+    Вспомогательная функция, позволяющая конкатенировать 2d и 1d входы модели в один 2d вход, с учетом
+    специфики работы 2D CNN модели. Результат может быть использован как входные данные для 2D CNN-модели.
+
+    Одномерная форма (LENGTH, FILTERS FOR INPUT) преобразуется к форме (HEIGHT, WEIGHT, FILTERS FOR OUTPUT).
+    Значения HEIGHT и WEIGHT берутся из формы входного 2D-тензора.
+    FILTERS FOR OUTPUT = LENGTH * [FILTERS FOR INPUT].
+    Каждый фильтр в новом 2d тензоре заполняется одним значением, взятым из соответствующей
+    позиции исходного 1d тензора.
+
+    :param input_1d: Числовой тензор с формой (BATCH SIZE, LENGTH, FILTERS FOR INPUT) или (LENGTH, FILTERS FOR INPUT),
+    в случае непакетной обработки.
+    :param input_2d: Числовой тензор с формой (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR INPUT)
+    или (HEIGHT, WEIGHT, FILTERS FOR INPUT), в случае непакетной обработки.
+    :return: Числовой (float32) тензор с формой (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR OUTPUT)
+    или (HEIGHT, WEIGHT, FILTERS FOR OUTPUT), , в случае непакетной обработки.
+    Реультируцющий тензор подходит для обработки 2D CNN моделью.
+    """
+    batch_size: int = input_1d.shape[0]
+    length: int = input_1d.shape[1]
+    number_of_filters: int = input_1d.shape[2]
+    height: int = input_2d.shape[1]
+    weight: int = input_2d.shape[2]
+
+    _input_2d: Tensor
+    _input_1d: Tensor
+    batch_mode: bool = len(input_2d.shape) == 4
+    if not batch_mode:
+        # преобразем данные к формату пакеты из одного примера входных даных.
+        # Это позволит выполнять дальнейшие вычисления единообразно.
+        _input_2d = tf.reshape(tensor=input_2d, shape=(1, input_2d.shape[0], input_2d.shape[1], input_2d.shape[2]))
+        _input_1d = tf.reshape(tensor=input_1d, shape=(1, input_1d.shape[0], input_1d.shape[1]))
+    else:
+        _input_2d = input_2d
+        _input_1d = input_1d
+
+    # TODO заменить Python генератор списков ( так как при этом разрывается граф вычислений)
+    #   на последовательность операций concat reshape broadcast_to
+    #   Пример _2d.shape = (batch, height, weight, filters1),  _1d.shape = (batch, length, filters2)
+    #   tf.concat(values=[_2d, tf.broadcast_to(tf.reshape(_1d, (batch, 1, 1, length * filters2)),
+    #       [batch, height, weight, length * filters2])], axis=3)
+
+    #  преобразуем 1d тензор в 2d тензор и конкатенируем тензоры по оси фильтра
+    _input_2d = tf.concat(values=(_input_2d,
+                                  tf.reshape(
+                                      tensor=tf.constant(value=[[[[[float(_input_1d[b, v, f]) for v in range(length)]
+                                                                   for f in range(number_of_filters)]
+                                                                  for _ in range(weight)]
+                                                                 for _ in range(height)]
+                                                                for b in range(batch_size)],
+                                                         shape=(batch_size, height, weight, number_of_filters, length),
+                                                         dtype=tf.dtypes.float32),
+                                      shape=(batch_size, height, weight, number_of_filters * length)
+                                  )),
+                          axis=3)
+
+    if not batch_mode:
+        _input_2d = tf.reshape(tensor=_input_2d, shape=_input_2d.shape[1:])
+
+    return _input_2d
+
+
+class Model2D(Model):
     """
       2D CNN модель, слои которой флормируются по общему алгоритму.
       Слои группируются в модули, вычисления в которых огранизованы по схеме
@@ -119,77 +182,9 @@ class Model2D:
 
         return model
 
-    def __1d_to_2d_input_tensor(self, tensor_1d: Tensor) -> Tensor:
-        """
-        Преобразует пакет одномерных (1D) многоканальных тензоров в
-        пакет двумерных (2D) многоканальных тензоров.
-        Форма (BATCH SIZE, LENGTH, FILTERS FOR INPUT) преобразуется к форме
-        (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR OUTPUT).
-        Тип данных выходного тензора float32.
-
-        Результат может быть использован как входные данные для 2D CNN-модели.
-
-        Значения HEIGHT и WEIGHT берутся из формы входного 2D-тензора.
-        FILTERS FOR OUTPUT = LENGTH * [FILTERS FOR INPUT].
-
-        Каждый фильтр в выходном тензоре заполняется одним значением, взятым из соответсвующей позиции исходного
-        одномерного тензора.
-
-        :param tensor_1d: Тензор с формой (BATCH SIZE, LENGTH, FILTERS FOR INPUT) и числовым типом данных.
-        :return: Тензор с формой (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR OUTPUT) и типом данных float32,
-        пригодный для обработки 2D CNN моделью.
-        """
-        batch_size: int = tensor_1d.shape[0]
-        length: int = tensor_1d.shape[1]
-        number_of_filters: int = tensor_1d.shape[2]
-
-        return tf.reshape(
-            tensor=tf.constant(value=[[[[[float(tensor_1d[b, v, f]) for v in range(length)]
-                                         for f in range(number_of_filters)]
-                                        for _ in range(self.input_2d_shape[1])]
-                                       for _ in range(self.input_2d_shape[0])]
-                                      for b in range(batch_size)],
-                               shape=(batch_size,
-                                      self.input_2d_shape[0], self.input_2d_shape[1],
-                                      number_of_filters, length),
-                               dtype=tf.dtypes.float32),
-            shape=(batch_size, self.input_2d_shape[0], self.input_2d_shape[1], number_of_filters * length)
-        )
-
-    # TODO вынести проблему приведение входа модели к определененому формату за пределы модели.
-    #       Создать абстрактный класс модели Model с абстрактными метододами
-    #       predict(self, input: Tensor, training: bool) -> Tensor
-    #       @property trainable_variables(self) -> Tensor
-    def predict(self, input_2d: Tensor, input_1d: Tensor, training: bool) -> Tensor:
-        """
-        Фычисление функции модели. Обучение модели при этом не выполняется.
-        :param training: Признак использования результатов вычисления для обучения модели.
-        :param input_2d: 2D вход модели в виде тензора формы (HEIGHT, WEIGHT, FILTERS FOR INPUT) или,
-        в случае вычисления для списка входных данных, (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR INPUT).
-        Параметры HEIGHT, WEIGHT и FILTERS FOR INPUT должны соответствовать структуре модели.
-        :param input_1d: 1D вход модели в виде тензора формы (LENGTH, FILTERS FOR INPUT) или,
-        в случае вычисления для списка входных данных, (BATCH SIZE, LENGTH, FILTERS FOR INPUT).
-        Параметры LENGTH и FILTERS FOR INPUT должны соответствовать структуре модели.
-        :return: 1D тензор результатов вычисления функции модели в форме (LENGTH, FILTERS FOR OUTPUT) или,
-        в случае вычисления для списка входных данных, (BATCH SIZE, LENGTH, FILTERS FOR OUTPUT)
-        """
-        _input_2d: Tensor
-        _input_1d: Tensor
-        batch_mode: bool = len(input_2d.shape) == 4
-        if not batch_mode:
-            # преобразем данные к формату пакеты из одного примера входных даных.
-            # Это позволит выполнять дальнейшие вычисления единообразно.
-            _input_2d = tf.reshape(tensor=input_2d, shape=(1, input_2d.shape[0], input_2d.shape[1], input_2d.shape[2]))
-            _input_1d = tf.reshape(tensor=input_1d, shape=(1, input_1d.shape[0], input_1d.shape[1]))
-        else:
-            _input_2d = input_2d
-            _input_1d = input_1d
-
-        #  преобразуем 1d тензор к 2d тензору и конкатенируем все полученные тензоры по оси фильтра
-        return self.__model(inputs=tf.concat(values=(_input_2d, self.__1d_to_2d_input_tensor(_input_1d)), axis=3),
-                            training=training)
+    def predict(self, model_input: Tensor, training: bool) -> Tensor:
+        return self.__model(inputs=model_input, training=training)
 
     @property
     def trainable_variables(self) -> Tensor:
         return self.__model.trainable_variables
-

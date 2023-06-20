@@ -6,12 +6,12 @@ https://keras.io/examples/rl/ddpg_pendulum/#introduction
 https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
+from typing import Callable, Union
+
 import numpy as np
 import tensorflow as tf
 
-from ntm_cnn_ddpg.cnn.model2d import Model2D
-
-Tensor = tf.Variable
+from ntm_cnn_ddpg.cnn.model import Model, Tensor
 
 
 class OUActionNoise:
@@ -49,11 +49,26 @@ class OUActionNoise:
 
 
 class Buffer:
-    def __init__(self, buffer_capacity: int, batch_size: int, size_of_state_space: int,
-                 target_critic: Model2D, target_actor: Model2D, critic_model: Model2D, actor_model: Model2D,
+    def __init__(self, buffer_capacity: int, batch_size: int,
+                 target_critic: Model, target_actor: Model, critic_model: Model, actor_model: Model,
                  critic_optimizer: tf.optimizers.Optimizer, actor_optimizer: tf.optimizers.Optimizer,
-                 q_learning_discount_factor: float  # Discount factor for future rewards
+                 q_learning_discount_factor: float,
+                 critic_model_input_concat: Callable[[Tensor, Tensor], Tensor]
                  ):
+        """
+        Инициализация
+        :param buffer_capacity: Максимальное количество хранимых наблюдений
+        :param batch_size: Размер пакета для оценки градиента функций потерь
+        :param target_critic: Целевая модель критика
+        :param target_actor: Целевая модель актора
+        :param critic_model: Модель критика
+        :param actor_model: Модель актора
+        :param critic_optimizer: Оптимизатор модели критика
+        :param actor_optimizer: Оптимизатор модели актора
+        :param q_learning_discount_factor: Discount factor for future rewards
+        :param critic_model_input_concat: Функция, объединяющая тензор состояния и тензор действия в единый тензор
+        выхода. Интерфейс функции (state batch, action batch) -> model input batch.
+        """
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
         # Num of tuples to train on.
@@ -62,12 +77,10 @@ class Buffer:
         # Its tells us num of times record() was called.
         self.buffer_counter = 0
 
-        # Instead of list of tuples as the exp.replay concept go
-        # We use different np.arrays for each tuple element
-        self.state_buffer = np.zeros((self.buffer_capacity, size_of_state_space))
-        self.action_buffer = np.zeros((self.buffer_capacity, size_of_state_space))
-        self.reward_buffer = np.zeros((self.buffer_capacity, 1))
-        self.next_state_buffer = np.zeros((self.buffer_capacity, size_of_state_space))
+        self.state_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
+        self.action_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
+        self.reward_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
+        self.next_state_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
 
         self.target_critic = target_critic
         self.target_actor = target_actor
@@ -78,6 +91,8 @@ class Buffer:
         self.actor_optimizer = actor_optimizer
 
         self.q_learning_discount_factor = tf.constant(q_learning_discount_factor, dtype=tf.float32)
+
+        self.critic_model_input_concat = critic_model_input_concat
 
     # Takes (s,a,r,s') observation tuple as input
     def record(self, observation: tuple[Tensor, Tensor, Tensor, Tensor]):
@@ -106,9 +121,10 @@ class Buffer:
         with tf.GradientTape() as tape:
             target_actions = self.target_actor.predict(next_state_batch, training=True)
             y = reward_batch + self.q_learning_discount_factor * self.target_critic.predict(
-                [next_state_batch, target_actions], training=True
+                self.critic_model_input_concat(next_state_batch, target_actions), training=True
             )
-            critic_value = self.critic_model.predict([state_batch, action_batch], training=True)
+            critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
+                                                     training=True)
             critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
 
         critic_grad = tape.gradient(critic_loss, self.critic_model.trainable_variables)
@@ -118,7 +134,8 @@ class Buffer:
 
         with tf.GradientTape() as tape:
             actions = self.actor_model.predict(state_batch, training=True)
-            critic_value = self.critic_model.predict([state_batch, actions], training=True)
+            critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, actions),
+                                                     training=True)
             # Used `-value` as we want to maximize the value given
             # by the critic for our actions
             actor_loss = -tf.math.reduce_mean(critic_value)
