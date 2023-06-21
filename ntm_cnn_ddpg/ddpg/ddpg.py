@@ -114,7 +114,7 @@ class Buffer:
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
     @tf.function
     def update(
-        self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
+            self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
     ):
         # Training and updating Actor & Critic networks.
         # See Pseudo Code.
@@ -152,12 +152,20 @@ class Buffer:
         # Randomly sample indices
         batch_indices = np.random.choice(record_range, self.batch_size)
 
-        # Convert to tensors
-        state_batch = tf.convert_to_tensor(self.state_buffer[batch_indices])
-        action_batch = tf.convert_to_tensor(self.action_buffer[batch_indices])
-        reward_batch = tf.convert_to_tensor(self.reward_buffer[batch_indices])
-        reward_batch = tf.cast(reward_batch, dtype=tf.float32)
-        next_state_batch = tf.convert_to_tensor(self.next_state_buffer[batch_indices])
+        # collect the batch
+        state_batch: Tensor = tf.concat(values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
+                                                for i in batch_indices],
+                                        axis=1)
+        action_batch: Tensor = tf.concat(values=[tf.reshape(self.action_buffer[i], [1, *self.action_buffer[i].shape])
+                                                 for i in batch_indices],
+                                         axis=1)
+        reward_batch: Tensor = tf.concat(values=[tf.reshape(self.reward_buffer[i], [1, *self.reward_buffer[i].shape])
+                                                 for i in batch_indices],
+                                         axis=1)
+        next_state_batch: Tensor = tf.concat(values=[tf.reshape(self.next_state_buffer[i],
+                                                                [1, *self.next_state_buffer[i].shape])
+                                                     for i in batch_indices],
+                                             axis=1)
 
         self.update(state_batch, action_batch, reward_batch, next_state_batch)
 
@@ -165,6 +173,6 @@ class Buffer:
 # This update target parameters slowly
 # Based on rate `tau`, which is much less than one.
 @tf.function
-def update_target(target_weights, weights, tau):
+def update_target(target_weights: Tensor, weights: Tensor, tau: Tensor):
     for (a, b) in zip(target_weights, weights):
         a.assign(b * tau + a * (1 - tau))

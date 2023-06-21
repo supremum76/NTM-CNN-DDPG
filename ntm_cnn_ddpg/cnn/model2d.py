@@ -43,24 +43,10 @@ def concat_input_tensors(input_2d: Tensor, input_1d: Tensor) -> Tensor:
         _input_2d = input_2d
         _input_1d = input_1d
 
-    # TODO заменить Python генератор списков ( так как при этом разрывается граф вычислений)
-    #   на последовательность операций concat reshape broadcast_to
-    #   Пример _2d.shape = (batch, height, weight, filters1),  _1d.shape = (batch, length, filters2)
-    #   tf.concat(values=[_2d, tf.broadcast_to(tf.reshape(_1d, (batch, 1, 1, length * filters2)),
-    #       [batch, height, weight, length * filters2])], axis=3)
-
     #  преобразуем 1d тензор в 2d тензор и конкатенируем тензоры по оси фильтра
-    _input_2d = tf.concat(values=(_input_2d,
-                                  tf.reshape(
-                                      tensor=tf.constant(value=[[[[[float(_input_1d[b, v, f]) for v in range(length)]
-                                                                   for f in range(number_of_filters)]
-                                                                  for _ in range(weight)]
-                                                                 for _ in range(height)]
-                                                                for b in range(batch_size)],
-                                                         shape=(batch_size, height, weight, number_of_filters, length),
-                                                         dtype=tf.dtypes.float32),
-                                      shape=(batch_size, height, weight, number_of_filters * length)
-                                  )),
+    _input_2d = tf.concat(values=[_input_2d,
+                                  tf.broadcast_to(tf.reshape(_input_1d, (batch_size, 1, 1, length * number_of_filters)),
+                                                  [batch_size, height, weight, length * number_of_filters])],
                           axis=3)
 
     if not batch_mode:
