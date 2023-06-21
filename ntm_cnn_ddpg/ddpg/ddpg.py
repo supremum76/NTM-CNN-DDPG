@@ -155,17 +155,17 @@ class Buffer:
         # collect the batch
         state_batch: Tensor = tf.concat(values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
                                                 for i in batch_indices],
-                                        axis=1)
+                                        axis=0)
         action_batch: Tensor = tf.concat(values=[tf.reshape(self.action_buffer[i], [1, *self.action_buffer[i].shape])
                                                  for i in batch_indices],
-                                         axis=1)
+                                         axis=0)
         reward_batch: Tensor = tf.concat(values=[tf.reshape(self.reward_buffer[i], [1, *self.reward_buffer[i].shape])
                                                  for i in batch_indices],
-                                         axis=1)
+                                         axis=0)
         next_state_batch: Tensor = tf.concat(values=[tf.reshape(self.next_state_buffer[i],
                                                                 [1, *self.next_state_buffer[i].shape])
                                                      for i in batch_indices],
-                                             axis=1)
+                                             axis=0)
 
         self.update(state_batch, action_batch, reward_batch, next_state_batch)
 
