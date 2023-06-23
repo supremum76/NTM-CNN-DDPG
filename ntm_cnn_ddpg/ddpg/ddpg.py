@@ -29,7 +29,7 @@ class OUActionNoise:
         self.x_initial = x_initial
         self.reset()
 
-    def __call__(self):
+    def __call__(self) -> Tensor:
         # Formula taken from https://www.wikipedia.org/wiki/Ornstein-Uhlenbeck_process.
         x = (
                 self.x_prev
@@ -176,3 +176,22 @@ class Buffer:
 def update_target(target_weights: Tensor, weights: Tensor, tau: Tensor):
     for (a, b) in zip(target_weights, weights):
         a.assign(b * tau + a * (1 - tau))
+
+
+def policy(actor_model: Model, state: Tensor, noise_object: OUActionNoise):
+    """
+     Returns an action sampled from our Actor network plus some noise for exploration.
+    :param actor_model: Actor model
+    :param state: State
+    :param noise_object: Noise generator
+    :return: Action
+    """
+
+    return actor_model.predict(model_input=state, training=False) + noise_object()
+
+
+# TODO Добавить класс DDPG и методы
+#  learn(prev_state, action, reward, next_state)
+#  policy
+#  update_target
+#  Конструктор класса получает модели, noise_object, buffer
