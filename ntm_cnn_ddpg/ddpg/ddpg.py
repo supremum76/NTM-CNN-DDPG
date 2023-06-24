@@ -6,7 +6,7 @@ https://keras.io/examples/rl/ddpg_pendulum/#introduction
 https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
-from typing import Callable, Union
+from typing import Callable
 
 import numpy as np
 import tensorflow as tf
@@ -21,7 +21,7 @@ class OUActionNoise:
     It samples noise from a correlated normal distribution.
     """
 
-    def __init__(self, mean: Tensor, std_deviation: Tensor, theta=0.15, dt=1e-2, x_initial=None):
+    def __init__(self, mean: Tensor, std_deviation: Tensor, theta=0.15, dt=1e-2, x_initial: Tensor | None = None):
         self.theta = theta
         self.mean = mean
         self.std_dev = std_deviation
@@ -77,10 +77,10 @@ class Buffer:
         # Its tells us num of times record() was called.
         self.buffer_counter = 0
 
-        self.state_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
-        self.action_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
-        self.reward_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
-        self.next_state_buffer: list[Union[Tensor, None]] = [None for _ in range(self.buffer_capacity)]
+        self.state_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
+        self.action_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
+        self.reward_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
+        self.next_state_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
 
         self.target_critic = target_critic
         self.target_actor = target_actor
@@ -170,31 +170,6 @@ class Buffer:
         self.update(state_batch, action_batch, reward_batch, next_state_batch)
 
 
-# This update target parameters slowly
-# Based on rate `tau`, which is much less than one.
-@tf.function
-def update_target(target_weights: Tensor, weights: Tensor, tau: Tensor):
-    for (a, b) in zip(target_weights, weights):
-        a.assign(b * tau + a * (1 - tau))
-
-
-def policy(actor_model: Model, state: Tensor, noise_object: OUActionNoise):
-    """
-     Returns an action sampled from our Actor network plus some noise for exploration.
-    :param actor_model: Actor model
-    :param state: State
-    :param noise_object: Noise generator
-    :return: Action
-    """
-
-    return actor_model.predict(model_input=state, training=False) + noise_object()
-
-
-# TODO Добавить класс DDPG и методы
-#  learn(prev_state, action, reward, next_state)
-#  policy
-#  update_target
-#  Конструктор класса получает модели, noise_object, buffer
 class DDPG:
     def __init__(self,
                  target_critic: Model,
@@ -212,13 +187,26 @@ class DDPG:
         self.noise_object = noise_object
         self.target_model_update_rate = target_model_update_rate
 
+    def policy(self, state: Tensor) -> Tensor:
+        """
+         Returns an action sampled from our Actor network plus some noise for exploration.
+        :param state: State
+        :return: Action
+        """
+
+        return self.actor_model.predict(model_input=state, training=False) + self.noise_object()
+
     def learn(self, prev_state: Tensor, action: Tensor, reward: Tensor, next_state: Tensor) -> None:
         self.buffer.record(observation=(prev_state, action, reward, next_state))
 
         self.buffer.learn()
 
-        update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables,
-                      self.target_model_update_rate)
-        update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables,
-                      self.target_model_update_rate)
+        self._update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables)
+        self._update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables)
 
+    # This update target parameters slowly
+    # Based on rate `tau`, which is much less than one.
+    @tf.function
+    def _update_target(self, target_weights: Tensor, weights: Tensor):
+        for (a, b) in zip(target_weights, weights):
+            a.assign(b * self.target_model_update_rate + a * (1 - self.target_model_update_rate))
