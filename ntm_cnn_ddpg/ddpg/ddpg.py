@@ -195,3 +195,30 @@ def policy(actor_model: Model, state: Tensor, noise_object: OUActionNoise):
 #  policy
 #  update_target
 #  Конструктор класса получает модели, noise_object, buffer
+class DDPG:
+    def __init__(self,
+                 target_critic: Model,
+                 target_actor: Model,
+                 critic_model: Model,
+                 actor_model: Model,
+                 buffer: Buffer,
+                 noise_object: OUActionNoise,
+                 target_model_update_rate: Tensor):
+        self.target_critic = target_critic
+        self.target_actor = target_actor
+        self.critic_model = critic_model
+        self.actor_model = actor_model
+        self.buffer = buffer
+        self.noise_object = noise_object
+        self.target_model_update_rate = target_model_update_rate
+
+    def learn(self, prev_state: Tensor, action: Tensor, reward: Tensor, next_state: Tensor) -> None:
+        self.buffer.record(observation=(prev_state, action, reward, next_state))
+
+        self.buffer.learn()
+
+        update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables,
+                      self.target_model_update_rate)
+        update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables,
+                      self.target_model_update_rate)
+
