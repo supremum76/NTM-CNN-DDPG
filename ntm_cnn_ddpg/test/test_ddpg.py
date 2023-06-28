@@ -3,6 +3,13 @@ import itertools
 from enum import Enum
 from unittest import TestCase
 
+import tensorflow as tf
+from keras.optimizers import Optimizer
+
+from ntm_cnn_ddpg.cnn.model import Tensor
+from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
+from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
+
 
 class TicTacToeGameStatus(Enum):
     DRAW = 0
@@ -19,7 +26,6 @@ class TicTacToePosStatus(Enum):
 
 class TestDDPG(TestCase):
 
-    @staticmethod
     def _test_tic_tac_toe_without_ntm(self) -> None:
         """
         Тест связки DDPG+CNN на способность обучится игре крестики нолики на поле 3x3.
@@ -57,12 +63,90 @@ class TestDDPG(TestCase):
         game_state: list[list[TicTacToePosStatus]] = [[TicTacToePosStatus.EMPTY] * 3] * 3
 
         # создаем модели критика и актора
-        #  target_critic: Model
-        #                  target_actor: Model,
-        #                  critic_model: Model,
-        #                  actor_model: Model,
+        target_actor: Model2D = Model2D(
+            input_2d_shape=(3, 3, 1),
+            input_1d_shape=(0, 0),
+            output_length=3*3,
+            start_filters=10,
+            start_kernel_size=(2, 2),
+            start_pool_size=(2, 2),
+            rate_of_filters_increase=1,
+            rate_of_kernel_size_increase=0,
+            rate_of_pool_size_increase=0
+        )
+
+        target_critic: Model2D = Model2D(
+            input_2d_shape=(3, 3, 1),
+            input_1d_shape=(0, 0),
+            output_length=3 * 3,
+            start_filters=10,
+            start_kernel_size=(2, 2),
+            start_pool_size=(2, 2),
+            rate_of_filters_increase=1,
+            rate_of_kernel_size_increase=0,
+            rate_of_pool_size_increase=0
+        )
+
+        actor_model: Model2D = Model2D(
+            input_2d_shape=(3, 3, 1),
+            input_1d_shape=(0, 0),
+            output_length=3 * 3,
+            start_filters=10,
+            start_kernel_size=(2, 2),
+            start_pool_size=(2, 2),
+            rate_of_filters_increase=1,
+            rate_of_kernel_size_increase=0,
+            rate_of_pool_size_increase=0
+        )
+
+        critic_model: Model2D = Model2D(
+            input_2d_shape=(3, 3, 1),
+            input_1d_shape=(0, 0),
+            output_length=3 * 3,
+            start_filters=10,
+            start_kernel_size=(2, 2),
+            start_pool_size=(2, 2),
+            rate_of_filters_increase=1,
+            rate_of_kernel_size_increase=0,
+            rate_of_pool_size_increase=0
+        )
+
+        # Learning rate for actor - critic models
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=0.002)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 
         # содаем буфер и источник шума для исследований
+
+        def critic_model_input_concat(state_batch: Tensor, action_batch: Tensor) -> Tensor:
+            """
+            :param state_batch: state batch
+            :param action_batch: action batch
+            :return: critic model input batch
+            """
+
+            return concat_input_tensors(state_batch, action_batch)
+
+        buffer: Buffer = Buffer(
+            buffer_capacity=10000,
+            batch_size=100,
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            critic_optimizer=critic_optimizer,
+            actor_optimizer=actor_optimizer,
+            q_learning_discount_factor=0.9,
+            critic_model_input_concat=lambda state_batch, action_batch: concat_input_tensors(state_batch, action_batch))
+
+        ddpg: DDPG = DDPG(
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            buffer=buffer,
+            noise_object=OUActionNoise(mean=tf.constant(0.0), std_deviation=tf.constant(0.1)),
+            target_model_update_rate=0.005
+        )
 
         # Разыгрываем серию игр.
         # DDPG играет за кресты против условного игрока, который случайным образом заполняет нулями свободные ячейки.
@@ -71,6 +155,7 @@ class TestDDPG(TestCase):
         # Выход DDPG дополнительно обрабатывается функцией softmax.
         # Затем выбирается свободная позиция с максимальным значением вероятности.
         # В эту позицию DDPG помещает свой знак.
+        self.fail()
 
     def test_learn(self):
-        self.fail()
+        self._test_tic_tac_toe_without_ntm()

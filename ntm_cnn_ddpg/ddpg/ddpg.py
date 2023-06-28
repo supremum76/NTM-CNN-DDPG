@@ -67,7 +67,7 @@ class Buffer:
         :param actor_optimizer: Оптимизатор модели актора
         :param q_learning_discount_factor: Discount factor for future rewards
         :param critic_model_input_concat: Функция, объединяющая тензор состояния и тензор действия в единый тензор
-        выхода. Интерфейс функции (state batch, action batch) -> model input batch.
+        выхода. Интерфейс функции (state batch, action batch) -> critic model input batch.
         """
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
@@ -117,7 +117,6 @@ class Buffer:
             self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
     ):
         # Training and updating Actor & Critic networks.
-        # See Pseudo Code.
         with tf.GradientTape() as tape:
             target_actions = self.target_actor.predict(next_state_batch, training=True)
             y = reward_batch + self.q_learning_discount_factor * self.target_critic.predict(
@@ -178,14 +177,14 @@ class DDPG:
                  actor_model: Model,
                  buffer: Buffer,
                  noise_object: OUActionNoise,
-                 target_model_update_rate: Tensor):
+                 target_model_update_rate: float):
         self.target_critic = target_critic
         self.target_actor = target_actor
         self.critic_model = critic_model
         self.actor_model = actor_model
         self.buffer = buffer
         self.noise_object = noise_object
-        self.target_model_update_rate = target_model_update_rate
+        self.target_model_update_rate = tf.constant(target_model_update_rate)
 
     def policy(self, state: Tensor) -> Tensor:
         """
