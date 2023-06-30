@@ -1,5 +1,7 @@
 import functools
 import itertools
+from collections import namedtuple
+from copy import deepcopy
 from enum import Enum
 from unittest import TestCase
 
@@ -60,8 +62,6 @@ class TestDDPG(TestCase):
             else:
                 return TicTacToeGameStatus.DRAW
 
-        game_state: list[list[TicTacToePosStatus]] = [[TicTacToePosStatus.EMPTY] * 3] * 3
-
         # создаем модели критика и актора
         target_actor: Model2D = Model2D(
             input_2d_shape=(3, 3, 1),
@@ -77,8 +77,8 @@ class TestDDPG(TestCase):
 
         target_critic: Model2D = Model2D(
             input_2d_shape=(3, 3, 1),
-            input_1d_shape=(0, 0),
-            output_length=3 * 3,
+            input_1d_shape=(3 * 3, 1),
+            output_length=1,
             start_filters=10,
             start_kernel_size=(2, 2),
             start_pool_size=(2, 2),
@@ -101,8 +101,8 @@ class TestDDPG(TestCase):
 
         critic_model: Model2D = Model2D(
             input_2d_shape=(3, 3, 1),
-            input_1d_shape=(0, 0),
-            output_length=3 * 3,
+            input_1d_shape=(3 * 3, 1),  # TODO неочевидна связь между выходом actor и входом critic. Необходима фабрика.
+            output_length=1,
             start_filters=10,
             start_kernel_size=(2, 2),
             start_pool_size=(2, 2),
@@ -115,17 +115,7 @@ class TestDDPG(TestCase):
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=0.002)
         actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 
-        # содаем буфер и источник шума для исследований
-
-        def critic_model_input_concat(state_batch: Tensor, action_batch: Tensor) -> Tensor:
-            """
-            :param state_batch: state batch
-            :param action_batch: action batch
-            :return: critic model input batch
-            """
-
-            return concat_input_tensors(state_batch, action_batch)
-
+        # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(
             buffer_capacity=10000,
             batch_size=100,
@@ -155,7 +145,65 @@ class TestDDPG(TestCase):
         # Выход DDPG дополнительно обрабатывается функцией softmax.
         # Затем выбирается свободная позиция с максимальным значением вероятности.
         # В эту позицию DDPG помещает свой знак.
-        self.fail()
+        game_state: list[list[TicTacToePosStatus]] = [[TicTacToePosStatus.EMPTY] * 3] * 3
+        GameMapPoint = namedtuple('GameMapPoint', ['r', 'c'])
+        for game_num in range(100000):
+            for r in range(3):
+                for c in range(3):
+                    game_state[r][c] = TicTacToePosStatus.EMPTY
+
+            while True:
+                original_action: Tensor = ddpg.policy(
+                    tf.constant(list(map(lambda x: x.value, itertools.chain(*game_state))), dtype=tf.float32))
+                action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
+                    tf.reshape(tensor=original_action, shape=(1, 3 * 3))),
+                    shape=(3, 3))
+
+                # выбираем свободную позицию для хода
+                point: GameMapPoint | None = None
+                max_prob: float = -1
+                for r in range(3):
+                    for c in range(3):
+                        if game_state[r][c] == TicTacToePosStatus.EMPTY:
+                            prob: float = float(action[r, c])
+                            if prob > max_prob:
+                                point = GameMapPoint(r, c)
+                                max_prob = prob
+
+                # ход DDPG
+                prev_game_state = deepcopy(game_state)
+                if point:
+                    game_state[point.r][point.c] = TicTacToePosStatus.CROSS
+                else:
+                    self.fail(msg="Game solution not selected")
+
+                # проверяем статус игры
+                game_status: TicTacToeGameStatus = check_of_end_game(game_state)
+                reward: float = 0
+                if game_status == TicTacToeGameStatus.CROSS_WON:
+                    reward = 1
+
+                if game_status == TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    pass  # TODO ход противника
+
+                # проверяем статус игры
+                game_status = check_of_end_game(game_state)
+
+                if game_status == TicTacToeGameStatus.ZERO_WON:
+                    reward = -1
+
+                ddpg.learn(
+                    prev_state=tf.constant(list(map(lambda x: x.value, itertools.chain(*prev_game_state))),
+                                           dtype=tf.float32),
+                    action=original_action,
+                    reward=reward,
+                    next_state=tf.constant(list(map(lambda x: x.value, itertools.chain(*game_state))),
+                                           dtype=tf.float32)
+                )
+
+                if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    # TODO собираем статистику по исходам игры
+                    break
 
     def test_learn(self):
         self._test_tic_tac_toe_without_ntm()

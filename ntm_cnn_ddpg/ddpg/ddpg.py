@@ -195,8 +195,8 @@ class DDPG:
 
         return self.actor_model.predict(model_input=state, training=False) + self.noise_object()
 
-    def learn(self, prev_state: Tensor, action: Tensor, reward: Tensor, next_state: Tensor) -> None:
-        self.buffer.record(observation=(prev_state, action, reward, next_state))
+    def learn(self, prev_state: Tensor, action: Tensor, reward: float, next_state: Tensor) -> None:
+        self.buffer.record(observation=(prev_state, action, tf.constant(reward), next_state))
 
         self.buffer.learn()
 
