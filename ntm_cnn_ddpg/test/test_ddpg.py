@@ -1,5 +1,5 @@
-import functools
 import itertools
+import random
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
@@ -61,6 +61,20 @@ class TestDDPG(TestCase):
                 return TicTacToeGameStatus.THE_GAME_CONTINUES
             else:
                 return TicTacToeGameStatus.DRAW
+
+        def opponent_action(game_state: list[list[TicTacToePosStatus]]) \
+                -> tuple[int, int] | None:
+            """
+            Реализация стратегии опонента в виде случайного выбора позиции
+            :param game_state: game state
+            :return: Позиция хода опонента (row, column)
+            """
+            empty_pos: [tuple[int, int]] = [(r, c) for r in range(3) for c in range(3)
+                                            if game_state[r][c] == TicTacToePosStatus.EMPTY]
+            if empty_pos:
+                return empty_pos[random.randrange(0, len(empty_pos))]
+            else:
+                return None
 
         # создаем модели критика и актора
         target_actor: Model2D = Model2D(
@@ -145,6 +159,8 @@ class TestDDPG(TestCase):
         # Выход DDPG дополнительно обрабатывается функцией softmax.
         # Затем выбирается свободная позиция с максимальным значением вероятности.
         # В эту позицию DDPG помещает свой знак.
+        win_rate: float = 0
+        history_win_rate: list[float] = []
         game_state: list[list[TicTacToePosStatus]] = [[TicTacToePosStatus.EMPTY] * 3] * 3
         GameMapPoint = namedtuple('GameMapPoint', ['r', 'c'])
         for game_num in range(100000):
@@ -184,13 +200,14 @@ class TestDDPG(TestCase):
                     reward = 1
 
                 if game_status == TicTacToeGameStatus.THE_GAME_CONTINUES:
-                    pass  # TODO ход противника
+                    r, c = opponent_action(game_state)
+                    game_state[r][c] = TicTacToePosStatus.ZERO
 
-                # проверяем статус игры
-                game_status = check_of_end_game(game_state)
+                    # проверяем статус игры
+                    game_status = check_of_end_game(game_state)
 
-                if game_status == TicTacToeGameStatus.ZERO_WON:
-                    reward = -1
+                    if game_status == TicTacToeGameStatus.ZERO_WON:
+                        reward = -1
 
                 ddpg.learn(
                     prev_state=tf.constant(list(map(lambda x: x.value, itertools.chain(*prev_game_state))),
@@ -202,8 +219,16 @@ class TestDDPG(TestCase):
                 )
 
                 if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
-                    # TODO собираем статистику по исходам игры
+                    # собираем статистику по исходам игры
+                    if game_state == TicTacToeGameStatus.CROSS_WON:
+                        win_rate += 1
+
+                    if game_num % 100 == 0:
+                        history_win_rate.append(win_rate / 100)
+
                     break
+
+        print(history_win_rate)
 
     def test_learn(self):
         self._test_tic_tac_toe_without_ntm()
