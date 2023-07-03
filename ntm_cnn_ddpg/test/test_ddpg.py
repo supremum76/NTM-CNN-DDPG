@@ -76,11 +76,27 @@ class TestDDPG(TestCase):
             else:
                 return None
 
+        # TODO поле 3x3 необходимо фиктивно расширить до 4x4, чтобы при start_pool_size 2x2 корректно обработалось
+        #  все поле 3x3
+        def game_state_to_model_input(game_state: list[list[TicTacToePosStatus]]) -> Tensor:
+            # Дополняем игровое поле до размера 4x4
+            extended_game_state = deepcopy(game_state)
+            extended_game_state[0].append(TicTacToePosStatus.EMPTY)
+            extended_game_state[1].append(TicTacToePosStatus.EMPTY)
+            extended_game_state[2].append(TicTacToePosStatus.EMPTY)
+            extended_game_state.append([TicTacToePosStatus.EMPTY] * 4)
+
+            return tf.reshape(
+                tensor=tf.constant(list(map(lambda x: x.value, itertools.chain(*extended_game_state))),
+                                   dtype=tf.float32),
+                shape=(4, 4, 1)
+            )
+
         # создаем модели критика и актора
         target_actor: Model2D = Model2D(
-            input_2d_shape=(3, 3, 1),
+            input_2d_shape=(4, 4, 1),
             input_1d_shape=(0, 0),
-            output_length=3*3,
+            output_length=3 * 3,
             start_filters=10,
             start_kernel_size=(2, 2),
             start_pool_size=(2, 2),
@@ -90,7 +106,7 @@ class TestDDPG(TestCase):
         )
 
         target_critic: Model2D = Model2D(
-            input_2d_shape=(3, 3, 1),
+            input_2d_shape=(4, 4, 1),
             input_1d_shape=(3 * 3, 1),
             output_length=1,
             start_filters=10,
@@ -102,7 +118,7 @@ class TestDDPG(TestCase):
         )
 
         actor_model: Model2D = Model2D(
-            input_2d_shape=(3, 3, 1),
+            input_2d_shape=(4, 4, 1),
             input_1d_shape=(0, 0),
             output_length=3 * 3,
             start_filters=10,
@@ -114,7 +130,7 @@ class TestDDPG(TestCase):
         )
 
         critic_model: Model2D = Model2D(
-            input_2d_shape=(3, 3, 1),
+            input_2d_shape=(4, 4, 1),
             input_1d_shape=(3 * 3, 1),  # TODO неочевидна связь между выходом actor и входом critic. Необходима фабрика.
             output_length=1,
             start_filters=10,
@@ -169,8 +185,7 @@ class TestDDPG(TestCase):
                     game_state[r][c] = TicTacToePosStatus.EMPTY
 
             while True:
-                original_action: Tensor = ddpg.policy(
-                    tf.constant(list(map(lambda x: x.value, itertools.chain(*game_state))), dtype=tf.float32))
+                original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
                 action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
                     tf.reshape(tensor=original_action, shape=(1, 3 * 3))),
                     shape=(3, 3))
@@ -210,12 +225,10 @@ class TestDDPG(TestCase):
                         reward = -1
 
                 ddpg.learn(
-                    prev_state=tf.constant(list(map(lambda x: x.value, itertools.chain(*prev_game_state))),
-                                           dtype=tf.float32),
+                    prev_state=game_state_to_model_input(prev_game_state),
                     action=original_action,
                     reward=reward,
-                    next_state=tf.constant(list(map(lambda x: x.value, itertools.chain(*game_state))),
-                                           dtype=tf.float32)
+                    next_state=game_state_to_model_input(game_state)
                 )
 
                 if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
@@ -225,6 +238,7 @@ class TestDDPG(TestCase):
 
                     if game_num % 100 == 0:
                         history_win_rate.append(win_rate / 100)
+                        win_rate = 0
 
                     break
 

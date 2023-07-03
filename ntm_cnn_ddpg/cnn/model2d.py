@@ -123,9 +123,7 @@ class Model2D(Model):
 
         input_shape: tuple[int, int, int] = (self.input_2d_shape[0], self.input_2d_shape[1],
                                              self.input_2d_shape[2] + self.input_1d_shape[0] * self.input_1d_shape[1])
-        layer: Layer = Input(shape=input_shape, dtype=tf.float32)
-        model.add(layer=layer)
-        output_shape: TensorShape = layer.compute_output_shape(input_shape=input_shape)
+        output_shape = tf.TensorShape(dims=input_shape)
 
         module_filters: float = self.start_filters
         module_kernel_size: list[float, float] = list(self.start_kernel_size)
@@ -134,7 +132,7 @@ class Model2D(Model):
         # выполняем цикл пока не получим на выходе сверточной сети тензор с формой (1, 1, filters).
         # Пока не сведем размер 2D плоскости к точке с некоторым количеством фильтров.
         # Применять свертку и объединение к такой точке уже не требуется.
-        while output_shape[0] == 1 and output_shape[1] == 1:
+        while not (output_shape[0] == 1 and output_shape[1] == 1):
             # строим модуль, состоящий из последовательности слоев
             module_input_shape = output_shape  # форма входа совпадает с выходом последнего слоя предыдущего модуля
 
@@ -148,12 +146,14 @@ class Model2D(Model):
                                   padding="same",
                                   activation=tf.nn.softsign)
             model.add(layer=conv)
-            output_shape = conv.compute_output_shape(input_shape=module_input_shape)
+            # При расчете выходной формы тензора добавляем фиктивный BATCH SIZE, так как tensorflow ожидает его.
+            output_shape = conv.compute_output_shape(input_shape=[1] + module_input_shape)[1:]
 
             # слой объединения
             max_pooling: MaxPooling2D = MaxPooling2D(pool_size=(int(module_pool_size[0]), int(module_pool_size[1])))
             model.add(layer=max_pooling)
-            output_shape = max_pooling.compute_output_shape(input_shape=output_shape)
+            # При расчете выходной формы тензора добавляем фиктивный BATCH SIZE, так как tensorflow ожидает его.
+            output_shape = max_pooling.compute_output_shape(input_shape=[1] + output_shape)[1:]
 
             module_filters *= (1 + self.rate_of_filters_increase)
             module_kernel_size[0] *= (1 + self.rate_of_kernel_size_increase)
