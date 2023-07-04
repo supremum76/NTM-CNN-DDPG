@@ -169,7 +169,27 @@ class Model2D(Model):
         return model
 
     def predict(self, model_input: Tensor, training: bool) -> Tensor:
-        return self.__model(inputs=model_input, training=training)
+        """
+        Вычисление функции модели.
+        :param model_input: Тензор входных данных. Может иметь форму (HEIGHT, WEIGHT, FILTERS) или
+        (BATCH SIZE, HEIGHT, WEIGHT, FILTERS).
+        :param training: Признак режима обучения модели.
+        :return: Тензор результата вычислений в форме (OUTPUTS) или (BATCH SIZE, OUTPUTS),
+        в зависимости от формы входа.
+        """
+
+        batch_mode: bool = model_input.shape.ndims == 4
+
+        result: Tensor = self.__model(inputs=
+                                      model_input if batch_mode else
+                                      # добавляем фиктивное измерение пакета
+                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
+                                      training=training)
+        if not batch_mode:
+            # удаляем фиктивное измерение пакета
+            result = tf.reshape(tensor=result, shape=self.output_length)
+
+        return result
 
     @property
     def trainable_variables(self) -> Tensor:

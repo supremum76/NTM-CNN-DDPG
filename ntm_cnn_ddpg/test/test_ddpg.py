@@ -26,6 +26,9 @@ class TicTacToePosStatus(Enum):
     ZERO = -1
 
 
+Point2D = namedtuple('Point2D', ['r', 'c'])
+
+
 class TestDDPG(TestCase):
 
     def _test_tic_tac_toe_without_ntm(self) -> None:
@@ -36,11 +39,12 @@ class TestDDPG(TestCase):
         https://en.wikipedia.org/wiki/Tic-tac-toe
         :return:
         """
+
         def check_of_end_game(game_state: list[list[TicTacToePosStatus]]) -> TicTacToeGameStatus:
             transpose_game_state: list[list[TicTacToePosStatus]] = [list(x) for x in zip(*game_state)]
 
-            if [TicTacToePosStatus.CROSS]*3 in game_state \
-                    or [TicTacToePosStatus.CROSS]*3 in transpose_game_state \
+            if [TicTacToePosStatus.CROSS] * 3 in game_state \
+                    or [TicTacToePosStatus.CROSS] * 3 in transpose_game_state \
                     or (game_state[0][0] == TicTacToePosStatus.CROSS
                         and game_state[1][1] == TicTacToePosStatus.CROSS
                         and game_state[2][2] == TicTacToePosStatus.CROSS) \
@@ -48,8 +52,8 @@ class TestDDPG(TestCase):
                         and transpose_game_state[1][1] == TicTacToePosStatus.CROSS
                         and transpose_game_state[2][2] == TicTacToePosStatus.CROSS):
                 return TicTacToeGameStatus.CROSS_WON
-            elif [TicTacToePosStatus.ZERO]*3 in game_state \
-                    or [TicTacToePosStatus.ZERO]*3 in transpose_game_state \
+            elif [TicTacToePosStatus.ZERO] * 3 in game_state \
+                    or [TicTacToePosStatus.ZERO] * 3 in transpose_game_state \
                     or (game_state[0][0] == TicTacToePosStatus.ZERO
                         and game_state[1][1] == TicTacToePosStatus.ZERO
                         and game_state[2][2] == TicTacToePosStatus.ZERO) \
@@ -63,7 +67,7 @@ class TestDDPG(TestCase):
                 return TicTacToeGameStatus.DRAW
 
         def opponent_action(game_state: list[list[TicTacToePosStatus]]) \
-                -> tuple[int, int] | None:
+                -> Point2D | None:
             """
             Реализация стратегии опонента в виде случайного выбора позиции
             :param game_state: game state
@@ -76,10 +80,8 @@ class TestDDPG(TestCase):
             else:
                 return None
 
-        # TODO поле 3x3 необходимо фиктивно расширить до 4x4, чтобы при start_pool_size 2x2 корректно обработалось
-        #  все поле 3x3
         def game_state_to_model_input(game_state: list[list[TicTacToePosStatus]]) -> Tensor:
-            # Дополняем игровое поле до размера 4x4
+            # Дополняем игровое поле до размера 4x4, чтобы сверточная 2D модель могла корректно обработать его.
             extended_game_state = deepcopy(game_state)
             extended_game_state[0].append(TicTacToePosStatus.EMPTY)
             extended_game_state[1].append(TicTacToePosStatus.EMPTY)
@@ -177,8 +179,8 @@ class TestDDPG(TestCase):
         # В эту позицию DDPG помещает свой знак.
         win_rate: float = 0
         history_win_rate: list[float] = []
-        game_state: list[list[TicTacToePosStatus]] = [[TicTacToePosStatus.EMPTY] * 3] * 3
-        GameMapPoint = namedtuple('GameMapPoint', ['r', 'c'])
+        game_state: list[list[TicTacToePosStatus]] = \
+            [[TicTacToePosStatus.EMPTY] * 3, [TicTacToePosStatus.EMPTY] * 3, [TicTacToePosStatus.EMPTY] * 3]
         for game_num in range(100000):
             for r in range(3):
                 for c in range(3):
@@ -191,14 +193,14 @@ class TestDDPG(TestCase):
                     shape=(3, 3))
 
                 # выбираем свободную позицию для хода
-                point: GameMapPoint | None = None
+                point: Point2D | None = None
                 max_prob: float = -1
                 for r in range(3):
                     for c in range(3):
                         if game_state[r][c] == TicTacToePosStatus.EMPTY:
                             prob: float = float(action[r, c])
                             if prob > max_prob:
-                                point = GameMapPoint(r, c)
+                                point = Point2D(r, c)
                                 max_prob = prob
 
                 # ход DDPG
