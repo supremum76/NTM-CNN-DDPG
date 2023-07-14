@@ -6,9 +6,10 @@ from enum import Enum
 from unittest import TestCase
 
 import tensorflow as tf
+from keras import layers
 from keras.optimizers import Optimizer
 
-from ntm_cnn_ddpg.cnn.model import Tensor
+from ntm_cnn_ddpg.cnn.model import Tensor, Model
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
 from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
 
@@ -27,6 +28,30 @@ class TicTacToePosStatus(Enum):
 
 
 Point2D = namedtuple('Point2D', ['r', 'c'])
+
+
+class DenseModel(Model):
+    def __init__(self, tf_model, output_length):
+        self.__model = tf_model
+        self.output_length = output_length
+
+    def predict(self, model_input: Tensor, training: bool) -> Tensor:
+        batch_mode: bool = model_input.shape.ndims == 2
+
+        result: Tensor = self.__model(inputs=
+                                      model_input if batch_mode else
+                                      # добавляем фиктивное измерение пакета
+                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
+                                      training=training)
+        if not batch_mode:
+            # удаляем фиктивное измерение пакета
+            result = tf.reshape(tensor=result, shape=self.output_length)
+
+        return result
+
+    @property
+    def trainable_variables(self) -> Tensor:
+        return self.__model.trainable_variables
 
 
 class TestDDPG(TestCase):
@@ -150,7 +175,7 @@ class TestDDPG(TestCase):
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(
             buffer_capacity=10000,
-            batch_size=100,
+            batch_size=500,
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,
@@ -158,7 +183,11 @@ class TestDDPG(TestCase):
             critic_optimizer=critic_optimizer,
             actor_optimizer=actor_optimizer,
             q_learning_discount_factor=0.9,
-            critic_model_input_concat=lambda state_batch, action_batch: concat_input_tensors(state_batch, action_batch))
+            critic_model_input_concat=lambda state_batch, action_batch:
+            # добавляем к действиям фиктивное измерение фильтра,  чтобы привести их к форме, ожидаемой
+            # функцией concat_input_tensors
+            concat_input_tensors(state_batch, tf.reshape(action_batch, (*action_batch.shape, 1)))
+        )
 
         ddpg: DDPG = DDPG(
             target_critic=target_critic,
@@ -235,10 +264,10 @@ class TestDDPG(TestCase):
 
                 if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
                     # собираем статистику по исходам игры
-                    if game_state == TicTacToeGameStatus.CROSS_WON:
+                    if game_status == TicTacToeGameStatus.CROSS_WON:
                         win_rate += 1
 
-                    if game_num % 100 == 0:
+                    if game_num > 0 and game_num % 100 == 0:
                         history_win_rate.append(win_rate / 100)
                         win_rate = 0
 
@@ -246,5 +275,201 @@ class TestDDPG(TestCase):
 
         print(history_win_rate)
 
+    def _test_tic_tac_toe_mlp_without_ntm(self) -> None:
+        """
+        Тест связки DDPG+MLP на способность обучится игре крестики нолики на поле 3x3.
+        NTM не используется.
+        Проверяется способность DDPG+MLP определить оптимальные правила поведения в игре.
+        https://en.wikipedia.org/wiki/Tic-tac-toe
+        :return:
+        """
+
+        def check_of_end_game(game_state: list[list[TicTacToePosStatus]]) -> TicTacToeGameStatus:
+            transpose_game_state: list[list[TicTacToePosStatus]] = [list(x) for x in zip(*game_state)]
+
+            if [TicTacToePosStatus.CROSS] * 3 in game_state \
+                    or [TicTacToePosStatus.CROSS] * 3 in transpose_game_state \
+                    or (game_state[0][0] == TicTacToePosStatus.CROSS
+                        and game_state[1][1] == TicTacToePosStatus.CROSS
+                        and game_state[2][2] == TicTacToePosStatus.CROSS) \
+                    or (transpose_game_state[0][0] == TicTacToePosStatus.CROSS
+                        and transpose_game_state[1][1] == TicTacToePosStatus.CROSS
+                        and transpose_game_state[2][2] == TicTacToePosStatus.CROSS):
+                return TicTacToeGameStatus.CROSS_WON
+            elif [TicTacToePosStatus.ZERO] * 3 in game_state \
+                    or [TicTacToePosStatus.ZERO] * 3 in transpose_game_state \
+                    or (game_state[0][0] == TicTacToePosStatus.ZERO
+                        and game_state[1][1] == TicTacToePosStatus.ZERO
+                        and game_state[2][2] == TicTacToePosStatus.ZERO) \
+                    or (transpose_game_state[0][0] == TicTacToePosStatus.ZERO
+                        and transpose_game_state[1][1] == TicTacToePosStatus.ZERO
+                        and transpose_game_state[2][2] == TicTacToePosStatus.ZERO):
+                return TicTacToeGameStatus.ZERO_WON
+            elif TicTacToePosStatus.EMPTY in itertools.chain(*game_state):
+                return TicTacToeGameStatus.THE_GAME_CONTINUES
+            else:
+                return TicTacToeGameStatus.DRAW
+
+        def opponent_action(game_state: list[list[TicTacToePosStatus]]) \
+                -> Point2D | None:
+            """
+            Реализация стратегии опонента в виде случайного выбора позиции
+            :param game_state: game state
+            :return: Позиция хода опонента (row, column)
+            """
+            empty_pos: [tuple[int, int]] = [(r, c) for r in range(3) for c in range(3)
+                                            if game_state[r][c] == TicTacToePosStatus.EMPTY]
+            if empty_pos:
+                return empty_pos[random.randrange(0, len(empty_pos))]
+            else:
+                return None
+
+        def game_state_to_model_input(game_state: list[list[TicTacToePosStatus]]) -> Tensor:
+            return tf.reshape(
+                tensor=tf.constant(list(map(lambda x: x.value, itertools.chain(*game_state))),
+                                   dtype=tf.float32),
+                shape=(3 * 3)
+            )
+
+        def get_actor_dense():
+            # Initialize weights between -3e-3 and 3-e3
+            last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+
+            inputs = layers.Input(shape=(3 * 3,))
+            out = layers.Dense(10, activation="relu")(inputs)
+            out = layers.Dense(10, activation="relu")(out)
+            outputs = layers.Dense(9, activation="tanh", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+            return model
+
+        def get_critic_dense():
+            # Initialize weights between -3e-3 and 3-e3
+            last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+
+            inputs = layers.Input(shape=(3 * 3 + 9,))
+            out = layers.Dense(10, activation="relu")(inputs)
+            out = layers.Dense(10, activation="relu")(out)
+            outputs = layers.Dense(1, activation="tanh", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+
+            return model
+
+        target_actor = DenseModel(get_actor_dense(), 9)
+        actor_model = DenseModel(get_actor_dense(), 9)
+        target_critic = DenseModel(get_critic_dense(), 1)
+        critic_model = DenseModel(get_critic_dense(), 1)
+
+        # Learning rate for actor - critic models
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3)
+
+        # содаем буфер обучающих примеров
+        buffer: Buffer = Buffer(
+            buffer_capacity=50000,
+            batch_size=10,
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            critic_optimizer=critic_optimizer,
+            actor_optimizer=actor_optimizer,
+            q_learning_discount_factor=0.9,
+            critic_model_input_concat=lambda state_batch, action_batch:
+            tf.concat(values=[state_batch, action_batch], axis=1)
+        )
+
+        ddpg: DDPG = DDPG(
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            buffer=buffer,
+            noise_object=OUActionNoise(mean=tf.constant([0.0]*9), std_deviation=tf.constant([0.1]*9)),
+            target_model_update_rate=0.005
+        )
+
+        # Разыгрываем серию игр.
+        # DDPG играет за кресты против условного игрока, который случайным образом заполняет нулями свободные ячейки.
+        # Для каждой следующий 100 игр считаем % побед DDPG.
+        # Состояним среды для DDPG является текущее состояние игрового поля.
+        # Выход DDPG дополнительно обрабатывается функцией softmax.
+        # Затем выбирается свободная позиция с максимальным значением вероятности.
+        # В эту позицию DDPG помещает свой знак.
+        win_rate: float = 0
+        history_win_rate: list[float] = []
+        game_state: list[list[TicTacToePosStatus]] = \
+            [[TicTacToePosStatus.EMPTY] * 3, [TicTacToePosStatus.EMPTY] * 3, [TicTacToePosStatus.EMPTY] * 3]
+        for game_num in range(100000):
+            for r in range(3):
+                for c in range(3):
+                    game_state[r][c] = TicTacToePosStatus.EMPTY
+
+            while True:
+                original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
+                action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
+                    tf.reshape(tensor=original_action, shape=(1, 3 * 3))),
+                    shape=(3, 3))
+
+                # выбираем свободную позицию для хода
+                point: Point2D | None = None
+                max_prob: float = -1
+                for r in range(3):
+                    for c in range(3):
+                        if game_state[r][c] == TicTacToePosStatus.EMPTY:
+                            prob: float = float(action[r, c])
+                            if prob > max_prob:
+                                point = Point2D(r, c)
+                                max_prob = prob
+
+                # ход DDPG
+                prev_game_state = deepcopy(game_state)
+                if point:
+                    game_state[point.r][point.c] = TicTacToePosStatus.CROSS
+                else:
+                    self.fail(msg="Game solution not selected")
+
+                # проверяем статус игры
+                game_status: TicTacToeGameStatus = check_of_end_game(game_state)
+                reward: float = 0
+                if game_status == TicTacToeGameStatus.CROSS_WON:
+                    reward = 1
+
+                if game_status == TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    r, c = opponent_action(game_state)
+                    game_state[r][c] = TicTacToePosStatus.ZERO
+
+                    # проверяем статус игры
+                    game_status = check_of_end_game(game_state)
+
+                    if game_status == TicTacToeGameStatus.ZERO_WON:
+                        reward = -1
+
+                ddpg.learn(
+                    prev_state=game_state_to_model_input(prev_game_state),
+                    action=original_action,
+                    reward=reward,
+                    next_state=game_state_to_model_input(game_state)
+                )
+
+                if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    # собираем статистику по исходам игры
+                    if game_status == TicTacToeGameStatus.CROSS_WON:
+                        win_rate += 1
+
+                    if game_num > 0 and game_num % 100 == 0:
+                        history_win_rate.append(win_rate / 100)
+                        win_rate = 0
+                        print(sum(history_win_rate)/len(history_win_rate))
+                        print(sum(history_win_rate[len(history_win_rate) - 30:])/len(history_win_rate[len(history_win_rate) - 30:]))
+                        print(history_win_rate[len(history_win_rate) - 10:])
+                        print(len(history_win_rate))
+
+                    break
+
+        print(history_win_rate)
+
     def test_learn(self):
-        self._test_tic_tac_toe_without_ntm()
+        # self._test_tic_tac_toe_without_ntm()
+        self._test_tic_tac_toe_mlp_without_ntm()

@@ -23,7 +23,7 @@ def concat_input_tensors(input_2d: Tensor, input_1d: Tensor) -> Tensor:
     или (HEIGHT, WEIGHT, FILTERS FOR INPUT), в случае непакетной обработки.
     :return: Числовой (float32) тензор с формой (BATCH SIZE, HEIGHT, WEIGHT, FILTERS FOR OUTPUT)
     или (HEIGHT, WEIGHT, FILTERS FOR OUTPUT), , в случае непакетной обработки.
-    Реультируцющий тензор подходит для обработки 2D CNN моделью.
+    Реультирующий тензор подходит для обработки 2D CNN моделью.
     """
     batch_size: int = input_1d.shape[0]
     length: int = input_1d.shape[1]
@@ -123,6 +123,8 @@ class Model2D(Model):
 
         input_shape: tuple[int, int, int] = (self.input_2d_shape[0], self.input_2d_shape[1],
                                              self.input_2d_shape[2] + self.input_1d_shape[0] * self.input_1d_shape[1])
+        model.add(tf.keras.Input(shape=input_shape))
+
         output_shape = tf.TensorShape(dims=input_shape)
 
         module_filters: float = self.start_filters

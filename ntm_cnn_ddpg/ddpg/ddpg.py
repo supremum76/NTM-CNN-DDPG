@@ -100,38 +100,54 @@ class Buffer:
         # replacing old records
         index = self.buffer_counter % self.buffer_capacity
 
-        self.state_buffer[index] = observation[0]
-        self.action_buffer[index] = observation[1]
-        self.reward_buffer[index] = observation[2]
-        self.next_state_buffer[index] = observation[3]
+        self.state_buffer[index] = tf.cast(observation[0], tf.float32)
+        self.action_buffer[index] = tf.cast(observation[1], tf.float32)
+        self.reward_buffer[index] = tf.cast(observation[2], tf.float32)
+        self.next_state_buffer[index] = tf.cast(observation[3], tf.float32)
 
         self.buffer_counter += 1
-        if self.buffer_counter == self.buffer_capacity:
-            self.buffer_counter = 0
+        if self.buffer_counter == self.buffer_capacity * 2:
+            self.buffer_counter = self.buffer_capacity
 
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    @tf.function
-    def update(
+    # @tf.function
+    def _update_critic_model(
             self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
-    ):
-        # Training and updating Actor & Critic networks.
-        with tf.GradientTape() as tape:
-            target_actions = self.target_actor.predict(next_state_batch, training=True)
+    ) -> Tensor:
+        # Training and updating Critic network.
+        with tf.GradientTape(watch_accessed_variables=False) as tape:
+            for t in self.critic_model.trainable_variables:
+                tape.watch(t)
+
+            target_actions = self.target_actor.predict(next_state_batch, training=False)
             y = reward_batch + self.q_learning_discount_factor * self.target_critic.predict(
-                self.critic_model_input_concat(next_state_batch, target_actions), training=True
+                self.critic_model_input_concat(next_state_batch, target_actions), training=False
             )
             critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
                                                      training=True)
             critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
 
         critic_grad = tape.gradient(critic_loss, self.critic_model.trainable_variables)
+
         self.critic_optimizer.apply_gradients(
             zip(critic_grad, self.critic_model.trainable_variables)
         )
 
-        with tf.GradientTape() as tape:
+
+        return critic_loss
+
+    # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
+    # TensorFlow to build a static graph out of the logic and computations in our function.
+    # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
+    # @tf.function
+    def _update_actor_model(self, state_batch: Tensor) -> Tensor:
+        # Training and updating Actor network.
+        with tf.GradientTape(watch_accessed_variables=False) as tape:
+            for t in self.actor_model.trainable_variables:
+                tape.watch(t)
+
             actions = self.actor_model.predict(state_batch, training=True)
             critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, actions),
                                                      training=True)
@@ -144,29 +160,48 @@ class Buffer:
             zip(actor_grad, self.actor_model.trainable_variables)
         )
 
+        return actor_loss
+
     # We compute the loss and update parameters
     def learn(self):
         # Get sampling range
         record_range = min(self.buffer_counter, self.buffer_capacity)
-        # Randomly sample indices
-        batch_indices = np.random.choice(record_range, self.batch_size)
 
-        # collect the batch
-        state_batch: Tensor = tf.concat(values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
-                                                for i in batch_indices],
-                                        axis=0)
-        action_batch: Tensor = tf.concat(values=[tf.reshape(self.action_buffer[i], [1, *self.action_buffer[i].shape])
-                                                 for i in batch_indices],
-                                         axis=0)
-        reward_batch: Tensor = tf.concat(values=[tf.reshape(self.reward_buffer[i], [1, *self.reward_buffer[i].shape])
-                                                 for i in batch_indices],
-                                         axis=0)
-        next_state_batch: Tensor = tf.concat(values=[tf.reshape(self.next_state_buffer[i],
-                                                                [1, *self.next_state_buffer[i].shape])
+        # TODO При обучении применять несколько эпох (min(max_iter, 1 + self.buffer_counter //  self.batch_size))
+        #  self._update дожна возвращать loss для для actor и critic (tuple[Tensor, Tensor])
+
+        for _ in range(30):  # TEST
+            # Randomly sample indices
+            batch_indices = np.random.choice(record_range, self.batch_size)
+
+            # collect the batch
+            state_batch: Tensor = tf.concat(values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
+                                                    for i in batch_indices],
+                                            axis=0)
+            action_batch: Tensor = tf.concat(values=[tf.reshape(self.action_buffer[i], [1, *self.action_buffer[i].shape])
                                                      for i in batch_indices],
                                              axis=0)
+            reward_batch: Tensor = tf.concat(values=[tf.reshape(self.reward_buffer[i], [1, 1])
+                                                     for i in batch_indices],
+                                             axis=0)
+            next_state_batch: Tensor = tf.concat(values=[tf.reshape(self.next_state_buffer[i],
+                                                                    [1, *self.next_state_buffer[i].shape])
+                                                         for i in batch_indices],
+                                                 axis=0)
 
-        self.update(state_batch, action_batch, reward_batch, next_state_batch)
+            critic_loss = self._update_critic_model(state_batch, action_batch, reward_batch, next_state_batch)
+
+        for _ in range(30):  # TEST
+            # Randomly sample indices
+            batch_indices = np.random.choice(record_range, self.batch_size)
+
+            # collect the batch
+            state_batch: Tensor = tf.concat(
+                values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
+                        for i in batch_indices],
+                axis=0)
+
+            actor_loss = self._update_actor_model(state_batch)
 
 
 class DDPG:
