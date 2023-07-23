@@ -13,8 +13,9 @@ Tensor = tf.Variable
 # (shape, initial_value) -> Tensor
 TensorFactory = Callable[[Sequence, Sequence], Tensor]
 
-# shape=[number of cells, cell length]
-MemoryBank = tf.TensorSpec(shape=[None, None], dtype=tf.float32, name="MemoryBank")
+# Mutable tensor for storing data of memory bank cell
+MemoryCell = tf.TensorSpec(shape=[None], dtype=tf.float32, name="MemoryCell")
+MemoryBankBuffer = tuple[MemoryCell, ...]
 
 
 def default_tensor_factory(shape: Sequence, initial_value: Sequence) -> Tensor:
@@ -22,14 +23,21 @@ def default_tensor_factory(shape: Sequence, initial_value: Sequence) -> Tensor:
                        shape=shape, dtype=tf.dtypes.float32, trainable=False)
 
 
-class Controller:
-    def __init__(self, memory_bank: MemoryBank, tensor_factory: TensorFactory = default_tensor_factory) -> None:
-        self._memory_bank: MemoryBank = memory_bank
-        self.memory_number_of_cells: int = memory_bank.shape[0]
-        self.memory_cell_length: int = memory_bank.shape[1]
+class MemoryBank:
+    def __init__(self, memory_bank_buffer: MemoryBankBuffer, memory_cell_length: int,
+                 tensor_factory: TensorFactory = default_tensor_factory) -> None:
+        """
+
+        :param memory_bank_buffer: Mutable tensor for storing data of memory bank
+        :memory_cell_length:
+        :param tensor_factory:
+        """
+        self._memory_bank: MemoryBankBuffer = memory_bank_buffer
+        self.memory_number_of_cells: int = len(memory_bank_buffer)
+        self.memory_cell_length: int = memory_cell_length
         self.tensor_factory = tensor_factory
 
-    def memory_bank_reading(self, w: Tensor) -> Tensor:
+    def reading(self, w: Tensor) -> Tensor:
         """
         Чтение банка памяти.
         :param w: Вектор весов чтения ячеек банка памяти. Длина вектора должна равняться количеству ячеек банка памяти.
@@ -38,22 +46,34 @@ class Controller:
         """
         result: Tensor = self.tensor_factory([self.memory_cell_length], [0 for _ in range(self.memory_cell_length)])
         for i in range(w.shape[0]):
-            result.assign_add(w[i] * self._memory_bank[i])
+            result.assign_add(w[i] * self._memory_bank[i], read_value=False)
 
         return result
 
-    def memory_bank_writing(self, w: Tensor, e: Tensor, a: Tensor) -> None:
+    def writing(self, w: Tensor, e: Tensor, a: Tensor) -> None:
         """
         Запись в банк памяти.
+
+        Применена модификация оригинального алгоритма.
+        В оригинальном алгоритме
+            1) m := m * (1 - w[i] * e)
+            2) m := m + w[i] * a
+        Это может приводить к ошибке переполнения.
+        Здесь алгоритм во втором шаге изменен
+        m := m + w[i] * e * a
+        Блок памяти по прежнему остается универсальным, так как любой код можно закодировать последовательностью из 2-х
+        и более знаков из фиксированного словаря. Здесь же словарь знаков даже не фиксирован
+        (доступно все множество рациональных чисел), но только их значение ограничено значениями вектора для добавления.
         :param w:
         :param e:
         :param a:
         """
         for i in range(self.memory_number_of_cells):
+            f: Tensor = e * w[i]
             # erase
-            self._memory_bank[i].assign(self._memory_bank[i] * (1 - e * w[i]))
+            self._memory_bank[i].assign(self._memory_bank[i] * (1 - f), read_value=False)
             # add
-            self._memory_bank[i].assign_add(w[i] * a)
+            self._memory_bank[i].assign_add(f * a, read_value=False)
 
     def focusing(self, w_previous: Tensor, key_content: Tensor, interpolation_gate: Tensor, focus_factor: Tensor,
                  distribution_of_allowed_shifts: Tensor) -> Tensor:

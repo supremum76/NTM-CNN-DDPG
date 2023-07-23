@@ -65,7 +65,7 @@ class Buffer:
         self.reward_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
         self.next_state_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
 
-    def record(self, state: Tensor, action:Tensor, reward: float, next_state: Tensor) -> None:
+    def record(self, state: Tensor, action: Tensor, reward: float, next_state: Tensor) -> None:
         """
         Takes and remember state, action, reward and next state
         :param state: state environment
@@ -76,7 +76,7 @@ class Buffer:
         """
         # Set index to zero if buffer_capacity is exceeded,
         # replacing old records
-        index = self.buffer_counter % self.buffer_capacity
+        index: int = self.buffer_counter % self.buffer_capacity
 
         self.state_buffer[index] = tf.cast(state, tf.float32)
         self.action_buffer[index] = tf.cast(action, tf.float32)
@@ -87,7 +87,8 @@ class Buffer:
         if self.buffer_counter == self.buffer_capacity * 2:
             self.buffer_counter = self.buffer_capacity
 
-    def new_batch_records(self, batch_size: int, only_state_batch: bool) -> tuple[Tensor, Tensor, Tensor, Tensor] | Tensor:
+    def new_batch_records(self, batch_size: int, only_state_batch: bool) \
+            -> tuple[Tensor, Tensor, Tensor, Tensor] | Tensor:
         """
         Return a new randomized batch of records for models learn
         :param batch_size: batch size
@@ -132,7 +133,6 @@ class DDPG:
                  target_actor: Model,
                  critic_model: Model,
                  actor_model: Model,
-                 target_model_update_rate: float,
                  critic_model_input_concat: Callable[[Tensor, Tensor], Tensor]):
         """
         Инициализация
@@ -140,7 +140,6 @@ class DDPG:
         :param target_actor: Целевая модель актора
         :param critic_model: Модель критика
         :param actor_model: Модель актора
-        :param target_model_update_rate:
         :param critic_model_input_concat: Функция, объединяющая тензор состояния и тензор действия в единый тензор
         входа для модели критика. Интерфейс функции (state batch, action batch) -> critic model input batch.
         """
@@ -148,7 +147,6 @@ class DDPG:
         self.target_actor = target_actor
         self.critic_model = critic_model
         self.actor_model = actor_model
-        self.target_model_update_rate = tf.constant(target_model_update_rate)
         self.critic_model_input_concat = critic_model_input_concat
 
     def policy(self, state: Tensor) -> Tensor:
@@ -159,32 +157,37 @@ class DDPG:
         """
         return self.actor_model.predict(model_input=state, training=False)
 
-    def learn(self, buffer: Buffer, batch_size: int, epochs: int, q_learning_discount_factor: Tensor,
+    def learn(self, buffer: Buffer, batch_size: int, epochs: int,
+              q_learning_discount_factor: float,
+              target_model_update_rate: float,
               critic_optimizer: tf.optimizers.Optimizer,
               actor_optimizer: tf.optimizers.Optimizer):
         for _ in range(epochs):
             self._update_critic_model(*buffer.new_batch_records(batch_size, only_state_batch=False),
                                       critic_optimizer=critic_optimizer,
-                                      q_learning_discount_factor=q_learning_discount_factor)
+                                      q_learning_discount_factor=tf.constant(q_learning_discount_factor))
 
         for _ in range(epochs):
             self._update_actor_model(state_batch=buffer.new_batch_records(batch_size, only_state_batch=True),
                                      actor_optimizer=actor_optimizer)
 
-        self._update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables)
-        self._update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables)
+        tensor_update_rate: Tensor = tf.constant(target_model_update_rate)
+        self._update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables,
+                            tensor_update_rate)
+        self._update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables,
+                            tensor_update_rate)
 
     # This update target parameters slowly
     # Based on rate target_model_update_rate, which is much less than one.
     @tf.function
-    def _update_target(self, target_weights: Tensor, weights: Tensor):
+    def _update_target(self, target_weights: Tensor, weights: Tensor, update_rate: Tensor):
         for (a, b) in zip(target_weights, weights):
-            a.assign(b * self.target_model_update_rate + a * (1 - self.target_model_update_rate))
+            a.assign(b * update_rate + a * (1.0 - update_rate))
 
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    # @tf.function
+    @tf.function
     def _update_critic_model(
             self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
             critic_optimizer: tf.optimizers.Optimizer,
@@ -212,7 +215,7 @@ class DDPG:
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    # @tf.function
+    @tf.function
     def _update_actor_model(self, state_batch: Tensor, actor_optimizer: tf.optimizers.Optimizer):
         # Training and updating Actor network.
         with tf.GradientTape(watch_accessed_variables=False) as tape:
@@ -230,4 +233,3 @@ class DDPG:
         actor_optimizer.apply_gradients(
             zip(actor_grad, self.actor_model.trainable_variables)
         )
-

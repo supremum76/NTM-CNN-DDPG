@@ -1,5 +1,6 @@
 import itertools
 import random
+import time
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
@@ -332,25 +333,29 @@ class TestDDPG(TestCase):
             )
 
         def get_actor_dense():
-            # Initialize weights between -3e-3 and 3-e3
-            last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            # !!! не используем layers.BatchNormalization(), так как игра меняеется в ходе обучения Actor и
+            # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
             inputs = layers.Input(shape=(3 * 3,))
-            out = layers.Dense(10, activation="relu")(inputs)
-            out = layers.Dense(10, activation="relu")(out)
-            outputs = layers.Dense(9, activation="tanh", kernel_initializer=last_init)(out)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(9, activation="linear", kernel_initializer=last_init)(out)
 
             model = tf.keras.Model(inputs, outputs)
             return model
 
         def get_critic_dense():
-            # Initialize weights between -3e-3 and 3-e3
-            last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            # !!! не используем layers.BatchNormalization(), так как игра меняеется в ходе обучения Actor и
+            # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
             inputs = layers.Input(shape=(3 * 3 + 9,))
-            out = layers.Dense(10, activation="relu")(inputs)
-            out = layers.Dense(10, activation="relu")(out)
-            outputs = layers.Dense(1, activation="tanh", kernel_initializer=last_init)(out)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(1, activation="linear", kernel_initializer=last_init)(out)
 
             model = tf.keras.Model(inputs, outputs)
 
@@ -361,14 +366,26 @@ class TestDDPG(TestCase):
         target_critic = DenseModel(get_critic_dense(), 1)
         critic_model = DenseModel(get_critic_dense(), 1)
 
-        # Learning rate for actor - critic models
-        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3)
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3)
+        # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
 
         # содаем буфер обучающих примеров
-        buffer: Buffer = Buffer(
-            buffer_capacity=50000,
-            batch_size=10,
+        buffer: Buffer = Buffer(buffer_capacity=50000)
+
+        ddpg: DDPG = DDPG(
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            critic_model_input_concat=lambda state_batch, action_batch:
+            tf.concat(values=[state_batch, action_batch], axis=1)
+        )
+
+        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0]*9), std_deviation=tf.constant([1.0]*9))
+
+        """
+        batch_size=10,
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,
@@ -376,19 +393,11 @@ class TestDDPG(TestCase):
             critic_optimizer=critic_optimizer,
             actor_optimizer=actor_optimizer,
             q_learning_discount_factor=0.9,
-            critic_model_input_concat=lambda state_batch, action_batch:
-            tf.concat(values=[state_batch, action_batch], axis=1)
-        )
-
-        ddpg: DDPG = DDPG(
-            target_critic=target_critic,
-            target_actor=target_actor,
-            critic_model=critic_model,
-            actor_model=actor_model,
-            buffer=buffer,
+            
             noise_object=OUActionNoise(mean=tf.constant([0.0]*9), std_deviation=tf.constant([0.1]*9)),
+            
             target_model_update_rate=0.005
-        )
+        """
 
         # Разыгрываем серию игр.
         # DDPG играет за кресты против условного игрока, который случайным образом заполняет нулями свободные ячейки.
@@ -408,6 +417,10 @@ class TestDDPG(TestCase):
 
             while True:
                 original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
+                k: Tensor = tf.reduce_mean(tf.abs(original_action))
+                noise: Tensor = exploration_noise() * (k * 0.2 if k > 0 else 1)
+                original_action = original_action + noise
+
                 action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
                     tf.reshape(tensor=original_action, shape=(1, 3 * 3))),
                     shape=(3, 3))
@@ -446,12 +459,20 @@ class TestDDPG(TestCase):
                     if game_status == TicTacToeGameStatus.ZERO_WON:
                         reward = -1
 
-                ddpg.learn(
-                    prev_state=game_state_to_model_input(prev_game_state),
-                    action=original_action,
-                    reward=reward,
-                    next_state=game_state_to_model_input(game_state)
-                )
+                buffer.record(state=game_state_to_model_input(prev_game_state),
+                              action=original_action,
+                              reward=reward,
+                              next_state=game_state_to_model_input(game_state))
+
+                ddpg.learn(buffer=buffer,
+                           batch_size=10,
+                           epochs=5,
+                           q_learning_discount_factor=0.9,
+                           # target_model_update_rate=0.005,
+                           target_model_update_rate=0.1,
+                           critic_optimizer=critic_optimizer,
+                           actor_optimizer=actor_optimizer
+                           )
 
                 if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
                     # собираем статистику по исходам игры
