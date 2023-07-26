@@ -71,5 +71,38 @@ class TestMemoryBank(TestCase):
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
 
-    def test_focusing(self):
-        pass
+    def test_focusing(self) -> None:
+        # Проверяем фокусировку по точному совпадению ключа со сдвигом 1 и без интерполяции.
+
+        memory_bank = MemoryBank(
+            memory_bank_buffer=tuple(tf.Variable(initial_value=[0] * 5, dtype=tf.float32) for _ in range(10)),
+            memory_cell_length=5
+        )
+
+        # writing
+        w = tf.constant(value=[0, 0, 1, 0, 0, 0, 0, 0, 0, 0], dtype=tf.float32)
+        e = tf.constant(value=[1] * 5, dtype=tf.float32)
+        a = tf.constant(value=[1, 2, 3, 4, 5], dtype=tf.float32)
+        memory_bank.writing(w=w, e=e, a=a)
+
+        w = tf.constant(value=[0, 0, 0, 1, 0, 0, 0, 0, 0, 0], dtype=tf.float32)
+        e = tf.constant(value=[1] * 5, dtype=tf.float32)
+        a = tf.constant(value=[6, 7, 8, 9, 10], dtype=tf.float32)
+        memory_bank.writing(w=w, e=e, a=a)
+
+        # focusing
+        w_previous = tf.constant(value=w)
+        key_content = tf.constant(value=[1, 2, 3, 4, 5], dtype=tf.float32)
+        interpolation_gate = tf.constant(1.0)
+        focus_factor = tf.constant(20.0)
+        distribution_of_allowed_shifts = tf.constant(value=[0, 1] + [0] * 18, dtype=tf.float32)
+        w = memory_bank.focusing(w_previous=w_previous,
+                                 key_content=key_content,
+                                 interpolation_gate=interpolation_gate,
+                                 focus_factor=focus_factor,
+                                 distribution_of_allowed_shifts=distribution_of_allowed_shifts)
+
+        # reading
+        data = memory_bank.reading(w)
+
+        self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), sum([6, 7, 8, 9, 10]), rel_tol=0.01, abs_tol=0.001))

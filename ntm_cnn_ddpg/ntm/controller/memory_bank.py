@@ -18,6 +18,11 @@ MemoryCell = tf.TensorSpec(shape=[None], dtype=tf.float32, name="MemoryCell")
 MemoryBankBuffer = tuple[MemoryCell, ...]
 
 
+# TODO Сделать все методы принимающими mutable-тензор для записи результата.
+#  Все внутренние тензоры-буферы создать в init.
+#  Все методы пометить как @tf.function
+#  tensor_factory не нужна.
+
 def default_tensor_factory(shape: Sequence, initial_value: Sequence) -> Tensor:
     return tf.Variable(initial_value=initial_value,
                        shape=shape, dtype=tf.dtypes.float32, trainable=False)
@@ -45,11 +50,12 @@ class MemoryBank:
         :return: Считанный вектор. Длина вектора равна длине ячейки банка памяти.
         """
         result: Tensor = self.tensor_factory([self.memory_cell_length], [0 for _ in range(self.memory_cell_length)])
-        for i in range(w.shape[0]):
+        for i in range(self.memory_number_of_cells):
             result.assign_add(w[i] * self._memory_bank[i], read_value=False)
 
         return result
 
+    @tf.function
     def writing(self, w: Tensor, e: Tensor, a: Tensor) -> None:
         """
         Запись в банк памяти.
@@ -82,32 +88,29 @@ class MemoryBank:
         w_next_c: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
             tf.reshape(tensor=tf.vectorized_map(fn=lambda x: tf.math.exp(focus_factor *
                                                                          self._cosine_similarity(key_content, x)),
-                                                elems=self._memory_bank),
+                                                elems=tf.stack(values=self._memory_bank, axis=0)),
                        shape=(1, self.memory_number_of_cells))),
             shape=self.memory_number_of_cells)
 
         # interpolation
-        one: Tensor = tf.constant(1, dtype=tf.dtypes.float32)
+        one: Tensor = tf.constant(value=1, dtype=tf.dtypes.float32)
         w_next_i: Tensor = interpolation_gate * w_next_c + (one - interpolation_gate) * w_previous
 
         # Focusing by Location
         # shift
-        tensor_list: list[Tensor] = []
+        tensor_list: list[float] = []
+        s: Tensor = tf.Variable(initial_value=[0], dtype=tf.dtypes.float32, shape=1)
+        zero: Tensor = tf.constant(value=0, dtype=tf.dtypes.float32, shape=1)
         for i in range(self.memory_number_of_cells):
-            s: Tensor = tf.constant(value=0, dtype=tf.dtypes.float32, shape=1)
+            s.assign(zero, read_value=False)
             for j in range(self.memory_number_of_cells):
-                s.assign_add(w_next_i[j] * distribution_of_allowed_shifts[(i - j) % self.memory_number_of_cells])
-            tensor_list.append(s)
+                s.assign_add(tf.reshape(tensor=w_next_i[j] * distribution_of_allowed_shifts[i - j], shape=1),
+                             read_value=False)
+            tensor_list.append(s.value())
 
-        w_next: Tensor = tf.reshape(tensor=self.tensor_factory((self.memory_number_of_cells, 1), tensor_list),
-                                    shape=self.memory_number_of_cells)
+        w_next: Tensor = tf.reshape(tensor=tf.stack(values=tensor_list), shape=self.memory_number_of_cells)
 
-        # final normalization (using the softmax function)
-        w_next_n = tf.reshape(
-            tensor=tf.keras.activations.softmax(tf.reshape(tensor=w_next, shape=(1, self.memory_number_of_cells))),
-            shape=self.memory_number_of_cells)
-
-        return w_next_n
+        return w_next
 
     @staticmethod
     @tf.function
