@@ -82,7 +82,7 @@ class MemoryBank:
             self._memory_bank[i].assign_add(f * a, read_value=False)
 
     def focusing(self, w_previous: Tensor, key_content: Tensor, interpolation_gate: Tensor, focus_factor: Tensor,
-                 distribution_of_allowed_shifts: Tensor) -> Tensor:
+                 distribution_shifts: Tensor) -> Tensor:
 
         # Focusing by Content
         w_next_c: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
@@ -103,8 +103,12 @@ class MemoryBank:
         zero: Tensor = tf.constant(value=0, dtype=tf.dtypes.float32, shape=1)
         for i in range(self.memory_number_of_cells):
             s.assign(zero, read_value=False)
-            for j in range(self.memory_number_of_cells):
-                s.assign_add(tf.reshape(tensor=w_next_i[j] * distribution_of_allowed_shifts[i - j], shape=1),
+            # начинаем перечислять индекс в диапазоне
+            # [-self.memory_number_of_cells + 1 , self.memory_number_of_cells - 1)
+            # чтобы заколцевать ленту памяти при вычислении сдвига
+            for j in range(-self.memory_number_of_cells + 1, self.memory_number_of_cells):
+                s.assign_add(tf.reshape(tensor=w_next_i[j] * distribution_shifts[(i - j)],
+                                        shape=1),
                              read_value=False)
             tensor_list.append(s.value())
 

@@ -1,4 +1,5 @@
 import math
+from random import random
 from unittest import TestCase
 
 import tensorflow as tf
@@ -75,7 +76,7 @@ class TestMemoryBank(TestCase):
         # Проверяем фокусировку по точному совпадению ключа со сдвигом 1 и без интерполяции.
 
         memory_bank = MemoryBank(
-            memory_bank_buffer=tuple(tf.Variable(initial_value=[0] * 5, dtype=tf.float32) for _ in range(10)),
+            memory_bank_buffer=tuple(tf.Variable(initial_value=[random()] * 5, dtype=tf.float32) for _ in range(10)),
             memory_cell_length=5
         )
 
@@ -100,7 +101,7 @@ class TestMemoryBank(TestCase):
                                  key_content=key_content,
                                  interpolation_gate=interpolation_gate,
                                  focus_factor=focus_factor,
-                                 distribution_of_allowed_shifts=distribution_of_allowed_shifts)
+                                 distribution_shifts=distribution_of_allowed_shifts)
 
         # reading
         data = memory_bank.reading(w)
