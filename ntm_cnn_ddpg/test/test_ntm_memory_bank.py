@@ -4,7 +4,7 @@ from unittest import TestCase
 
 import tensorflow as tf
 
-from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank, default_tensor_factory
+from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
 
 
 class TestMemoryBank(TestCase):
@@ -38,36 +38,37 @@ class TestMemoryBank(TestCase):
         memory_bank.writing(w=w, e=e, a=a)
 
         # reading
+        data = tf.Variable(initial_value=[0] * 5, dtype=tf.float32)
         w = tf.constant(value=[1, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=tf.float32)
-        data = memory_bank.reading(w)
+        memory_bank.reading(w, data)
         test_data = tf.constant([1 * (1 - 0.7 * 0.5), 2, 3 * (1 - 1 * 0.5), 4, 5 * (1 - 0.5 * 0.5)]) + \
-            tf.constant([-10 * 0.7 * 0.5, 0, -7 * 0.5, 0, -5 * 0.5 * 0.5])
+                    tf.constant([-10 * 0.7 * 0.5, 0, -7 * 0.5, 0, -5 * 0.5 * 0.5])
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
 
         w = tf.constant(value=[0, 0, 0, 0, 0, 0, 0, 0, 0, 1], dtype=tf.float32)
-        data = memory_bank.reading(w)
+        memory_bank.reading(w, data)
         test_data = tf.constant([-1 * (1 - 0.7 * 0.5), -2, -3 * (1 - 1 * 0.5), -4, -5 * (1 - 0.5 * 0.5)]) + \
-            tf.constant([-10 * 0.7 * 0.5, 0, -7 * 0.5, 0, -5 * 0.5 * 0.5])
+                    tf.constant([-10 * 0.7 * 0.5, 0, -7 * 0.5, 0, -5 * 0.5 * 0.5])
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
 
         w = tf.constant(value=[0, 0, 0, 0, 1, 0, 0, 0, 0, 0], dtype=tf.float32)
-        data = memory_bank.reading(w)
+        memory_bank.reading(w, data)
         test_data = tf.constant([10 * (1 - 0.7), 9, 0, 6, 5 * (1 - 0.5)]) + \
-            tf.constant([-10 * 0.7, 0, -7, 0, -5 * 0.5])
+                    tf.constant([-10 * 0.7, 0, -7, 0, -5 * 0.5])
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
 
         w = tf.constant(value=[0, 0, 0, 0.5, 0, 0.5, 0, 0, 0, 0], dtype=tf.float32)
-        data = memory_bank.reading(w)
+        memory_bank.reading(w, data)
         test_data = tf.constant([10, 9, 7, 6, 5], tf.float32) * 0.3 * 0.5 + tf.constant([10, 9, 7, 6, 5], tf.float32) \
-            * 0.7 * 0.5
+                    * 0.7 * 0.5
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
 
         w = tf.constant(value=[0, 0.2, 0.2, 0, 0, 0, 0.2, 0.2, 0.2, 0], dtype=tf.float32)
-        data = memory_bank.reading(w)
+        memory_bank.reading(w, data)
         test_data = tf.constant([0, 0, 0, 0, 0], tf.float32)
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), tf.reduce_sum(test_data).numpy(),
                                      rel_tol=0.01, abs_tol=0.001))
@@ -97,13 +98,16 @@ class TestMemoryBank(TestCase):
         interpolation_gate = tf.constant(1.0)
         focus_factor = tf.constant(20.0)
         distribution_of_allowed_shifts = tf.constant(value=[0, 1] + [0] * 18, dtype=tf.float32)
-        w = memory_bank.focusing(w_previous=w_previous,
-                                 key_content=key_content,
-                                 interpolation_gate=interpolation_gate,
-                                 focus_factor=focus_factor,
-                                 distribution_shifts=distribution_of_allowed_shifts)
+        w_next = tf.Variable(initial_value=[0] * w_previous.shape[0], dtype=tf.float32, shape=w_previous.shape)
+        memory_bank.focusing(w_previous=w_previous,
+                             key_content=key_content,
+                             interpolation_gate=interpolation_gate,
+                             focus_factor=focus_factor,
+                             distribution_shifts=distribution_of_allowed_shifts,
+                             w_next=w_next)
 
         # reading
-        data = memory_bank.reading(w)
+        data = tf.Variable(initial_value=[0] * 5, dtype=tf.float32)
+        memory_bank.reading(w_next, data)
 
         self.assertTrue(math.isclose(tf.reduce_sum(data).numpy(), sum([6, 7, 8, 9, 10]), rel_tol=0.01, abs_tol=0.001))

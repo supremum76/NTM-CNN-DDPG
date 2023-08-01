@@ -1,6 +1,5 @@
 import itertools
 import random
-import time
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
@@ -56,6 +55,7 @@ class DenseModel(Model):
         return self.__model.trainable_variables
 
 
+# TODO попробовать categorical policy (смотри tf.distributions.Categorical или tf.multinomial )
 class TestDDPG(TestCase):
 
     def _test_tic_tac_toe_without_ntm(self) -> None:
@@ -383,7 +383,8 @@ class TestDDPG(TestCase):
             tf.concat(values=[state_batch, action_batch], axis=1)
         )
 
-        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0]*9), std_deviation=tf.constant([1.0]*9))
+        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * 9),
+                                                         std_deviation=tf.constant([1.0] * 9))
 
         """
         batch_size=10,
@@ -483,8 +484,9 @@ class TestDDPG(TestCase):
                     if game_num > 0 and game_num % 100 == 0:
                         history_win_rate.append(win_rate / 100)
                         win_rate = 0
-                        print(sum(history_win_rate)/len(history_win_rate))
-                        print(sum(history_win_rate[len(history_win_rate) - 30:])/len(history_win_rate[len(history_win_rate) - 30:]))
+                        print(sum(history_win_rate) / len(history_win_rate))
+                        print(sum(history_win_rate[len(history_win_rate) - 30:]) / len(
+                            history_win_rate[len(history_win_rate) - 30:]))
                         print(history_win_rate[len(history_win_rate) - 10:])
                         print(len(history_win_rate))
 
@@ -618,13 +620,20 @@ class TestDDPG(TestCase):
         # сохранения считанных данных
         memory_bank_r: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
                                                  trainable=False)
+        prev_memory_bank_r: tf.Variable = memory_bank_r.value()
+
         # интерполяции
-        memory_bank_interpolation_gate: tf.Variable = tf.Variable(initial_value=[0], dtype=tf.float32, trainable=False)
+        memory_bank_interpolation_gate: tf.Variable = tf.Variable(initial_value=[0] * 2, dtype=tf.float32,
+                                                                  trainable=False)
         # сдвига
         memory_bank_distribution_shifts: tf.Variable = tf.Variable(initial_value=[0] * (memory_cell_length * 2 - 1),
                                                                    dtype=tf.float32, trainable=False)
         # фокусировки
         memory_bank_focus_factor: tf.Variable = tf.Variable(initial_value=[0], dtype=tf.float32, trainable=False)
+
+        # контент
+        memory_bank_key_content: tf.Variable = \
+            tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32, trainable=False)
 
         ddpg: DDPG = DDPG(
             target_critic=target_critic,
@@ -654,14 +663,61 @@ class TestDDPG(TestCase):
                 for c in range(3):
                     game_state[r][c] = TicTacToePosStatus.EMPTY
 
+            # манипулируем внешней памятью и формируем окончательное решение
             while True:
-                original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
-                k: Tensor = tf.reduce_mean(tf.abs(original_action))
-                noise: Tensor = exploration_noise() * (k * 0.2 if k > 0 else 1)
-                original_action = original_action + noise
+                game_action: Tensor
+                for _ in range(10):
+                    original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
+                    k: Tensor = tf.reduce_mean(tf.abs(original_action))
+                    noise: Tensor = exploration_noise() * (k * 0.2 if k > 0 else 1)
+                    original_action = original_action + noise
+
+                    # TODO add index_from, index_to
+                    #  джобавлять шум исследования после разделения действия
+                    #  разделяем действие
+                    game_action = original_action[:3 * 3]
+                    make_move: Tensor = original_action[3 * 3]
+                    memory_bank_e.assign(original_action[3 * 3 + 1: 3 * 3 + 1 + memory_cell_length])
+                    memory_bank_a: Tensor = original_action[3 * 3 + 1 + memory_cell_length:3 * 3 + 1 +
+                                                            memory_cell_length * 2]
+                    # TODO сделали memory_bank_interpolation_gate.shape = [2], чтобы можно было применить softmax
+                    memory_bank_interpolation_gate.assign(original_action[3 * 3 + 1 + memory_cell_length * 2])
+                    memory_bank_focus_factor.assign(tf.clip_by_value(
+                        t=tf.abs(original_action[3 * 3 + 1 + memory_cell_length * 2 + 1]),
+                        clip_value_min=1,
+                        clip_value_max=20))
+                    memory_bank_distribution_shifts.assign(original_action[3 * 3 + 1 + memory_cell_length * 2 + 2:
+                                                                           3 * 3 + 1 + memory_cell_length * 2 + 2 +
+                                                                           memory_number_of_cells * 2 - 1])
+                    memory_bank_key_content.assign(original_action[3 * 3 + 1 + memory_cell_length * 2 + 2 +
+                                                                   memory_number_of_cells * 2 - 1:
+                                                                   3 * 3 + 1 + memory_cell_length * 2 + 2 +
+                                                                   memory_number_of_cells * 3 - 1])
+
+                    memory_bank.focusing(w_previous=memory_bank_w,
+                                         key_content=memory_bank_key_content,
+                                         # TODO привести в диапазон softmax
+                                         interpolation_gate=memory_bank_interpolation_gate[0],
+                                         focus_factor=memory_bank_focus_factor,
+                                         # TODO привести в диапазон softmax
+                                         distribution_shift=memory_bank_distribution_shifts,
+                                         w_next=memory_bank_w)
+                    memory_bank.writing(w=memory_bank_w, a=memory_bank_a, e=memory_bank_e)
+                    prev_memory_bank_r.assign(memory_bank_r)
+                    memory_bank.reading(w=memory_bank_w, read_buffer=memory_bank_r)
+
+                    if make_move[0] > 0:
+                        break
+                    else:
+                        buffer.record(state=tf.concat(
+                            values=[game_state_to_model_input(prev_game_state), prev_memory_bank_r], axis=0),
+                            action=original_action,
+                            reward=0,
+                            next_state=
+                            tf.concat(values=[game_state_to_model_input(game_state), memory_bank_r], axis=0))
 
                 action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
-                    tf.reshape(tensor=original_action, shape=(1, 3 * 3))),
+                    tf.reshape(tensor=game_action, shape=(1, 3 * 3))),
                     shape=(3, 3))
 
                 # выбираем свободную позицию для хода
@@ -698,10 +754,11 @@ class TestDDPG(TestCase):
                     if game_status == TicTacToeGameStatus.ZERO_WON:
                         reward = -1
 
-                buffer.record(state=game_state_to_model_input(prev_game_state),
-                              action=original_action,
-                              reward=reward,
-                              next_state=game_state_to_model_input(game_state))
+                buffer.record(state=tf.concat(
+                    values=[game_state_to_model_input(prev_game_state), prev_memory_bank_r], axis=0),
+                    action=original_action,
+                    reward=reward,
+                    next_state=tf.concat(values=[game_state_to_model_input(game_state), memory_bank_r], axis=0))
 
                 ddpg.learn(buffer=buffer,
                            batch_size=10,
@@ -729,7 +786,6 @@ class TestDDPG(TestCase):
                     break
 
         print(history_win_rate)
-
 
     def test_learn(self):
         # self._test_tic_tac_toe_without_ntm()
