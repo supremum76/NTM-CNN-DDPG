@@ -562,7 +562,7 @@ class TestDDPG(TestCase):
         def get_actor_dense():
             last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
 
-            # !!! не используем layers.BatchNormalization(), так как игра меняеется в ходе обучения Actor и
+            # !!! не используем layers.BatchNormalization(), так как игра меняется в ходе обучения Actor и
             # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
             inputs = layers.Input(shape=(3 * 3,))
@@ -576,7 +576,7 @@ class TestDDPG(TestCase):
         def get_critic_dense():
             last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
 
-            # !!! не используем layers.BatchNormalization(), так как игра меняеется в ходе обучения Actor и
+            # !!! не используем layers.BatchNormalization(), так как игра меняется в ходе обучения Actor и
             # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
             inputs = layers.Input(shape=(3 * 3 + 9,))
@@ -623,6 +623,7 @@ class TestDDPG(TestCase):
         prev_memory_bank_r: tf.Variable = memory_bank_r.value()
 
         # интерполяции
+        # shape = [2], чтобы можно было применять softmax и получать значения на отрезке [0, 1]
         memory_bank_interpolation_gate: tf.Variable = tf.Variable(initial_value=[0] * 2, dtype=tf.float32,
                                                                   trainable=False)
         # сдвига
@@ -672,34 +673,50 @@ class TestDDPG(TestCase):
                     noise: Tensor = exploration_noise() * (k * 0.2 if k > 0 else 1)
                     original_action = original_action + noise
 
-                    # TODO add index_from, index_to
-                    #  джобавлять шум исследования после разделения действия
+                    #  добавлять шум исследования после разделения действия
                     #  разделяем действие
-                    game_action = original_action[:3 * 3]
-                    make_move: Tensor = original_action[3 * 3]
-                    memory_bank_e.assign(original_action[3 * 3 + 1: 3 * 3 + 1 + memory_cell_length])
-                    memory_bank_a: Tensor = original_action[3 * 3 + 1 + memory_cell_length:3 * 3 + 1 +
-                                                            memory_cell_length * 2]
-                    # TODO сделали memory_bank_interpolation_gate.shape = [2], чтобы можно было применить softmax
-                    memory_bank_interpolation_gate.assign(original_action[3 * 3 + 1 + memory_cell_length * 2])
-                    memory_bank_focus_factor.assign(tf.clip_by_value(
-                        t=tf.abs(original_action[3 * 3 + 1 + memory_cell_length * 2 + 1]),
-                        clip_value_min=1,
-                        clip_value_max=20))
-                    memory_bank_distribution_shifts.assign(original_action[3 * 3 + 1 + memory_cell_length * 2 + 2:
-                                                                           3 * 3 + 1 + memory_cell_length * 2 + 2 +
-                                                                           memory_number_of_cells * 2 - 1])
-                    memory_bank_key_content.assign(original_action[3 * 3 + 1 + memory_cell_length * 2 + 2 +
-                                                                   memory_number_of_cells * 2 - 1:
-                                                                   3 * 3 + 1 + memory_cell_length * 2 + 2 +
-                                                                   memory_number_of_cells * 3 - 1])
+                    index_from, index_to = 0, 3 * 3
+                    game_action = original_action[index_from:index_to]
+
+                    index_from, index_to = index_to, index_to + 1
+                    make_move: Tensor = original_action[index_from:index_to]
+
+                    index_from, index_to = index_to, index_to + memory_cell_length
+                    # приводим к [0, 1]
+                    value_max = tf.reduce_max(original_action[index_from:index_to])
+                    x = original_action[index_from:index_to]
+                    memory_bank_e.assign(x * tf.cast(x > 0, tf.float32) / value_max)
+
+                    index_from, index_to = index_to, index_to + memory_cell_length
+                    memory_bank_a: Tensor = original_action[index_from:index_to]
+
+                    # memory_bank_interpolation_gate.shape = [2], для того чтобы можно было применить softmax
+                    # и в качестве итогового значения выбрать memory_bank_interpolation_gate[0]
+                    index_from, index_to = index_to, index_to + 2
+                    memory_bank_interpolation_gate.assign(tf.reshape(
+                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=original_action[index_from:index_to],
+                                                                       shape=(1, 2))),
+                        shape=2))
+
+                    index_from, index_to = index_to, index_to + 1
+                    x = original_action[index_from:index_to]
+                    memory_bank_focus_factor.assign(tf.clip_by_value(t=x * tf.cast(x > 0, tf.float32) + 1,
+                                                                     clip_value_min=1,
+                                                                     clip_value_max=20))
+
+                    index_from, index_to = index_to, index_to + memory_cell_length * 2 - 1
+                    memory_bank_distribution_shifts.assign(tf.reshape(
+                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=original_action[index_from:index_to],
+                                                                       shape=(1, index_to - index_from))),
+                        shape=index_to - index_from))
+
+                    index_from, index_to = index_to, index_to + memory_cell_length
+                    memory_bank_key_content.assign(original_action[index_from:index_to])
 
                     memory_bank.focusing(w_previous=memory_bank_w,
                                          key_content=memory_bank_key_content,
-                                         # TODO привести в диапазон softmax
                                          interpolation_gate=memory_bank_interpolation_gate[0],
                                          focus_factor=memory_bank_focus_factor,
-                                         # TODO привести в диапазон softmax
                                          distribution_shift=memory_bank_distribution_shifts,
                                          w_next=memory_bank_w)
                     memory_bank.writing(w=memory_bank_w, a=memory_bank_a, e=memory_bank_e)
