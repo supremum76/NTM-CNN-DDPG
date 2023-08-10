@@ -588,15 +588,6 @@ class TestDDPG(TestCase):
 
             return model
 
-        target_actor = DenseModel(get_actor_dense(), 9)
-        actor_model = DenseModel(get_actor_dense(), 9)
-        target_critic = DenseModel(get_critic_dense(), 1)
-        critic_model = DenseModel(get_critic_dense(), 1)
-
-        # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
-        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
-
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
@@ -636,6 +627,18 @@ class TestDDPG(TestCase):
         memory_bank_key_content: tf.Variable = \
             tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32, trainable=False)
 
+        actor_output_length = 3 * 3 + 1 + memory_cell_length + memory_cell_length + 2 + 1 + memory_cell_length * 2 - 1\
+                                    + memory_cell_length
+
+        target_actor = DenseModel(get_actor_dense(), actor_output_length)
+        actor_model = DenseModel(get_actor_dense(), actor_output_length)
+        target_critic = DenseModel(get_critic_dense(), 1)
+        critic_model = DenseModel(get_critic_dense(), 1)
+
+        # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+
         ddpg: DDPG = DDPG(
             target_critic=target_critic,
             target_actor=target_actor,
@@ -645,8 +648,8 @@ class TestDDPG(TestCase):
             tf.concat(values=[state_batch, action_batch], axis=1)
         )
 
-        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * 9),
-                                                         std_deviation=tf.constant([1.0] * 9))
+        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
+                                                         std_deviation=tf.constant([1.0] * actor_output_length))
 
         # Разыгрываем серию игр.
         # DDPG играет за кресты против условного игрока, который случайным образом заполняет нулями свободные ячейки.
@@ -664,31 +667,38 @@ class TestDDPG(TestCase):
                 for c in range(3):
                     game_state[r][c] = TicTacToePosStatus.EMPTY
 
-            # манипулируем внешней памятью и формируем окончательное решение
+            noise_level: float = 0.2
             while True:
                 game_action: Tensor
+                # манипулируем внешней памятью и формируем окончательное решение
                 for _ in range(10):
-                    original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
-                    k: Tensor = tf.reduce_mean(tf.abs(original_action))
-                    noise: Tensor = exploration_noise() * (k * 0.2 if k > 0 else 1)
-                    original_action = original_action + noise
+                    noise: Tensor = exploration_noise()
 
+                    original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
                     #  добавлять шум исследования после разделения действия
                     #  разделяем действие
                     index_from, index_to = 0, 3 * 3
                     game_action = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(game_action))
+                    game_action += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
 
                     index_from, index_to = index_to, index_to + 1
-                    make_move: Tensor = original_action[index_from:index_to]
+                    make_move = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(make_move))
+                    make_move += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
 
                     index_from, index_to = index_to, index_to + memory_cell_length
                     # приводим к [0, 1]
                     value_max = tf.reduce_max(original_action[index_from:index_to])
                     x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
                     memory_bank_e.assign(x * tf.cast(x > 0, tf.float32) / value_max)
 
                     index_from, index_to = index_to, index_to + memory_cell_length
-                    memory_bank_a: Tensor = original_action[index_from:index_to]
+                    x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    memory_bank_a.assign(x + noise[index_from:index_to] * (k * noise_level if k > 0 else 1))
 
                     # memory_bank_interpolation_gate.shape = [2], для того чтобы можно было применить softmax
                     # и в качестве итогового значения выбрать memory_bank_interpolation_gate[0]
@@ -705,9 +715,11 @@ class TestDDPG(TestCase):
                                                                      clip_value_max=20))
 
                     index_from, index_to = index_to, index_to + memory_cell_length * 2 - 1
+                    x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
                     memory_bank_distribution_shifts.assign(tf.reshape(
-                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=original_action[index_from:index_to],
-                                                                       shape=(1, index_to - index_from))),
+                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=x, shape=(1, index_to - index_from))),
                         shape=index_to - index_from))
 
                     index_from, index_to = index_to, index_to + memory_cell_length
@@ -727,7 +739,7 @@ class TestDDPG(TestCase):
                         break
                     else:
                         buffer.record(state=tf.concat(
-                            values=[game_state_to_model_input(prev_game_state), prev_memory_bank_r], axis=0),
+                            values=[game_state_to_model_input(game_state), prev_memory_bank_r], axis=0),
                             action=original_action,
                             reward=0,
                             next_state=
