@@ -512,6 +512,11 @@ class TestDDPG(TestCase):
         :return: None
         """
 
+        memory_number_of_cells: int = 10
+        memory_cell_length: int = 5
+        actor_output_length: int = 3 * 3 + 1 + memory_cell_length + memory_cell_length + \
+                                   2 + 1 + (memory_number_of_cells * 2 - 1) + memory_cell_length
+
         def check_of_end_game(game_state: list[list[TicTacToePosStatus]]) -> TicTacToeGameStatus:
             transpose_game_state: list[list[TicTacToePosStatus]] = [list(x) for x in zip(*game_state)]
 
@@ -565,10 +570,10 @@ class TestDDPG(TestCase):
             # !!! не используем layers.BatchNormalization(), так как игра меняется в ходе обучения Actor и
             # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
-            inputs = layers.Input(shape=(3 * 3,))
+            inputs = layers.Input(shape=(3 * 3 + memory_cell_length,))
             out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
             out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
-            outputs = layers.Dense(9, activation="linear", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(actor_output_length, activation="linear", kernel_initializer=last_init)(out)
 
             model = tf.keras.Model(inputs, outputs)
             return model
@@ -579,7 +584,9 @@ class TestDDPG(TestCase):
             # !!! не используем layers.BatchNormalization(), так как игра меняется в ходе обучения Actor и
             # из-за этого смещается распределение входных сигналов. Это создает нестабильность восприятия игровой среды.
 
-            inputs = layers.Input(shape=(3 * 3 + 9,))
+            # TODO неочевидна связь между размером вектора состояния и размером вектора выхода актора.
+            #  Необходима фабрика actor/critic.
+            inputs = layers.Input(shape=(3 * 3 + memory_cell_length + actor_output_length,))
             out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
             out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
             outputs = layers.Dense(1, activation="linear", kernel_initializer=last_init)(out)
@@ -592,8 +599,6 @@ class TestDDPG(TestCase):
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
         # создаем внешний банк памяти из 10 ячеек с 5 позициями.
-        memory_number_of_cells: int = 10
-        memory_cell_length: int = 5
         memory_bank: MemoryBank = MemoryBank(
             memory_bank_buffer=tuple(tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32) for _
                                      in range(memory_number_of_cells)),
@@ -611,14 +616,15 @@ class TestDDPG(TestCase):
         # сохранения считанных данных
         memory_bank_r: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
                                                  trainable=False)
-        prev_memory_bank_r: tf.Variable = memory_bank_r.value()
+        prev_memory_bank_r: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
+                                                      trainable=False)
 
         # интерполяции
         # shape = [2], чтобы можно было применять softmax и получать значения на отрезке [0, 1]
         memory_bank_interpolation_gate: tf.Variable = tf.Variable(initial_value=[0] * 2, dtype=tf.float32,
                                                                   trainable=False)
         # сдвига
-        memory_bank_distribution_shifts: tf.Variable = tf.Variable(initial_value=[0] * (memory_cell_length * 2 - 1),
+        memory_bank_distribution_shifts: tf.Variable = tf.Variable(initial_value=[0] * (memory_number_of_cells * 2 - 1),
                                                                    dtype=tf.float32, trainable=False)
         # фокусировки
         memory_bank_focus_factor: tf.Variable = tf.Variable(initial_value=[0], dtype=tf.float32, trainable=False)
@@ -626,9 +632,6 @@ class TestDDPG(TestCase):
         # контент
         memory_bank_key_content: tf.Variable = \
             tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32, trainable=False)
-
-        actor_output_length = 3 * 3 + 1 + memory_cell_length + memory_cell_length + 2 + 1 + memory_cell_length * 2 - 1\
-                                    + memory_cell_length
 
         target_actor = DenseModel(get_actor_dense(), actor_output_length)
         actor_model = DenseModel(get_actor_dense(), actor_output_length)
@@ -674,7 +677,9 @@ class TestDDPG(TestCase):
                 for _ in range(10):
                     noise: Tensor = exploration_noise()
 
-                    original_action: Tensor = ddpg.policy(game_state_to_model_input(game_state))
+                    original_action: Tensor = ddpg.policy(
+                        tf.concat(values=(game_state_to_model_input(game_state), prev_memory_bank_r), axis=0)
+                    )
                     #  добавлять шум исследования после разделения действия
                     #  разделяем действие
                     index_from, index_to = 0, 3 * 3
@@ -688,12 +693,13 @@ class TestDDPG(TestCase):
                     make_move += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
 
                     index_from, index_to = index_to, index_to + memory_cell_length
-                    # приводим к [0, 1]
-                    value_max = tf.reduce_max(original_action[index_from:index_to])
                     x = original_action[index_from:index_to]
+                    value_max = tf.reduce_max(x)
                     k = tf.reduce_mean(tf.abs(x))
                     x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
-                    memory_bank_e.assign(x * tf.cast(x > 0, tf.float32) / value_max)
+                    # приводим к [0, 1]
+                    value_max = tf.reduce_max(x)
+                    memory_bank_e.assign(x * tf.cast(x > 0, tf.float32) / (value_max + tf.keras.backend.epsilon()))
 
                     index_from, index_to = index_to, index_to + memory_cell_length
                     x = original_action[index_from:index_to]
@@ -703,18 +709,22 @@ class TestDDPG(TestCase):
                     # memory_bank_interpolation_gate.shape = [2], для того чтобы можно было применить softmax
                     # и в качестве итогового значения выбрать memory_bank_interpolation_gate[0]
                     index_from, index_to = index_to, index_to + 2
+                    x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
                     memory_bank_interpolation_gate.assign(tf.reshape(
-                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=original_action[index_from:index_to],
-                                                                       shape=(1, 2))),
+                        tensor=tf.keras.activations.softmax(tf.reshape(tensor=x, shape=(1, 2))),
                         shape=2))
 
                     index_from, index_to = index_to, index_to + 1
                     x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
                     memory_bank_focus_factor.assign(tf.clip_by_value(t=x * tf.cast(x > 0, tf.float32) + 1,
                                                                      clip_value_min=1,
                                                                      clip_value_max=20))
 
-                    index_from, index_to = index_to, index_to + memory_cell_length * 2 - 1
+                    index_from, index_to = index_to, index_to + memory_number_of_cells * 2 - 1
                     x = original_action[index_from:index_to]
                     k = tf.reduce_mean(tf.abs(x))
                     x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
@@ -723,13 +733,18 @@ class TestDDPG(TestCase):
                         shape=index_to - index_from))
 
                     index_from, index_to = index_to, index_to + memory_cell_length
-                    memory_bank_key_content.assign(original_action[index_from:index_to])
+                    x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+                    memory_bank_key_content.assign(x)
 
+                    # TODO банк памяти необходимо иницировать разными значениями из комбинаций -1, 0 и 1
+                    #   например 00000 10000 01000 и т.д. Иначе во все ячейки идет одинаковая запись.
                     memory_bank.focusing(w_previous=memory_bank_w,
                                          key_content=memory_bank_key_content,
                                          interpolation_gate=memory_bank_interpolation_gate[0],
                                          focus_factor=memory_bank_focus_factor,
-                                         distribution_shift=memory_bank_distribution_shifts,
+                                         distribution_shifts=memory_bank_distribution_shifts,
                                          w_next=memory_bank_w)
                     memory_bank.writing(w=memory_bank_w, a=memory_bank_a, e=memory_bank_e)
                     prev_memory_bank_r.assign(memory_bank_r)
