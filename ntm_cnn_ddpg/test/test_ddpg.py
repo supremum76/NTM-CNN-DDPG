@@ -674,6 +674,15 @@ class TestDDPG(TestCase):
             while True:
                 game_action: Tensor
                 # манипулируем внешней памятью и формируем окончательное решение
+
+                # инициируем банк памяти
+                i: int = 0
+                for c in itertools.combinations_with_replacement([-1, 0, 1], memory_cell_length):
+                    w = tf.constant(value=[0 if j != i else 1 for j in range(memory_number_of_cells)], dtype=tf.float32)
+                    e = tf.constant(value=[1] * memory_cell_length, dtype=tf.float32)
+                    a = tf.constant(value=c, dtype=tf.float32)
+                    memory_bank.writing(w=w, e=e, a=a)
+                    i += 1
                 for _ in range(10):
                     noise: Tensor = exploration_noise()
 
@@ -738,8 +747,329 @@ class TestDDPG(TestCase):
                     x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
                     memory_bank_key_content.assign(x)
 
-                    # TODO банк памяти необходимо иницировать разными значениями из комбинаций -1, 0 и 1
-                    #   например 00000 10000 01000 и т.д. Иначе во все ячейки идет одинаковая запись.
+                    memory_bank.focusing(w_previous=memory_bank_w,
+                                         key_content=memory_bank_key_content,
+                                         interpolation_gate=memory_bank_interpolation_gate[0],
+                                         focus_factor=memory_bank_focus_factor,
+                                         distribution_shifts=memory_bank_distribution_shifts,
+                                         w_next=memory_bank_w)
+                    memory_bank.writing(w=memory_bank_w, a=memory_bank_a, e=memory_bank_e)
+                    prev_memory_bank_r.assign(memory_bank_r)
+                    memory_bank.reading(w=memory_bank_w, read_buffer=memory_bank_r)
+
+                    if make_move[0] > 0:
+                        break
+                    else:
+                        buffer.record(state=tf.concat(
+                            values=[game_state_to_model_input(game_state), prev_memory_bank_r], axis=0),
+                            action=original_action,
+                            reward=0,
+                            next_state=
+                            tf.concat(values=[game_state_to_model_input(game_state), memory_bank_r], axis=0))
+
+                action: Tensor = tf.reshape(tensor=tf.keras.activations.softmax(
+                    tf.reshape(tensor=game_action, shape=(1, 3 * 3))),
+                    shape=(3, 3))
+
+                # выбираем свободную позицию для хода
+                point: Point2D | None = None
+                max_prob: float = -1
+                for r in range(3):
+                    for c in range(3):
+                        if game_state[r][c] == TicTacToePosStatus.EMPTY:
+                            prob: float = float(action[r, c])
+                            if prob > max_prob:
+                                point = Point2D(r, c)
+                                max_prob = prob
+
+                # ход DDPG
+                prev_game_state = deepcopy(game_state)
+                if point:
+                    game_state[point.r][point.c] = TicTacToePosStatus.CROSS
+                else:
+                    self.fail(msg="Game solution not selected")
+
+                # проверяем статус игры
+                game_status: TicTacToeGameStatus = check_of_end_game(game_state)
+                reward: float = 0
+                if game_status == TicTacToeGameStatus.CROSS_WON:
+                    reward = 1
+
+                if game_status == TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    r, c = opponent_action(game_state)
+                    game_state[r][c] = TicTacToePosStatus.ZERO
+
+                    # проверяем статус игры
+                    game_status = check_of_end_game(game_state)
+
+                    if game_status == TicTacToeGameStatus.ZERO_WON:
+                        reward = -1
+
+                buffer.record(state=tf.concat(
+                    values=[game_state_to_model_input(prev_game_state), prev_memory_bank_r], axis=0),
+                    action=original_action,
+                    reward=reward,
+                    next_state=tf.concat(values=[game_state_to_model_input(game_state), memory_bank_r], axis=0))
+
+                ddpg.learn(buffer=buffer,
+                           batch_size=10,
+                           epochs=5,
+                           q_learning_discount_factor=0.9,
+                           target_model_update_rate=0.1,
+                           critic_optimizer=critic_optimizer,
+                           actor_optimizer=actor_optimizer
+                           )
+
+                if game_status != TicTacToeGameStatus.THE_GAME_CONTINUES:
+                    # собираем статистику по исходам игры
+                    if game_status == TicTacToeGameStatus.CROSS_WON:
+                        win_rate += 1
+
+                    if game_num > 0 and game_num % 100 == 0:
+                        history_win_rate.append(win_rate / 100)
+                        win_rate = 0
+                        print(sum(history_win_rate) / len(history_win_rate))
+                        print(sum(history_win_rate[len(history_win_rate) - 30:]) / len(
+                            history_win_rate[len(history_win_rate) - 30:]))
+                        print(history_win_rate[len(history_win_rate) - 10:])
+                        print(len(history_win_rate))
+
+                    break
+
+        print(history_win_rate)
+
+    def _test_binary_sequence_prediction_mlp_ntm(self) -> None:
+        """
+            Проверяем связку DDPG+MLP+NTM на "игре", требующей памяти.
+            Например, предсказание бинарной последовательности, являющейся
+            периодическим повторением некоторой однократно случайно сформированной бинарной последовательности заданной
+            длины. Без использования памяти прогноз такой последовательности невозможен.
+            на входе актора текущий считанный бит и считанная память, на выходе прогноз значения следующего бита.
+            Примеры:
+            01 01 01 0 -> 1
+            100 100 10 -> 0
+            1101 1101 1 -> 1
+
+            Необходимо оценить зависимость кол-ва итераций обучения для достижения точности 90% от длины базовой
+            последовательности. Остальные параметры фиксируем.
+            Можно вывести эмприческую аппроксиацию зависимости.
+
+            :return: None
+            """
+
+        base_block = [0, 1]
+        base_block_length: int = len(base_block)
+
+        memory_number_of_cells: int = 2
+        memory_cell_length: int = base_block_length
+        actor_output_length: int = (
+                2  # прогноз последовательности (0 или 1)
+                + memory_cell_length  # контент для фокусировки в блоке памяти для чтения/записи
+                + memory_cell_length  # вектор удаления данных
+                + memory_cell_length  # вектор записи данных
+                + 2  # коэффициент интерполяции из диапазона [0, 1]
+                + 1  # коэффициент контрастирования фокусировки
+                # вектор сдвига чтения/записи =
+                # [нулевой сдвиг, сдвиг на одну позицию вправо, сдвиг на одну позицию влево]
+                + 3
+        )
+
+        def get_actor_dense():
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            inputs = layers.Input(shape=(
+                1  # текущий считанный бит последовательности
+                + memory_cell_length  # считанное из памяти при предыдущем действии актора
+            ))
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(actor_output_length, activation="linear", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+            return model
+
+        def get_critic_dense():
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            inputs = layers.Input(
+                shape=(
+                    # текущее состояеие среды
+                    1  # текущий считанный бит последовательности
+                    + memory_cell_length  # считанное из памяти при предыдущем действии актора
+
+                    + actor_output_length  # текущее действие актора
+                )
+            )
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(10, activation="softsign", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(1, activation="linear", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+
+            return model
+
+        # содаем буфер обучающих примеров
+        buffer: Buffer = Buffer(buffer_capacity=50000)
+
+        # создаем внешний банк памяти
+        memory_bank: MemoryBank = MemoryBank(
+            memory_bank_buffer=tuple(tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32) for _
+                                     in range(memory_number_of_cells)),
+            memory_cell_length=memory_cell_length
+        )
+        # тензор весов для локализации чтения и записи
+        memory_bank_w: tf.Variable = tf.Variable(initial_value=[0] * memory_number_of_cells, dtype=tf.float32,
+                                                 trainable=False)
+        # удаления
+        memory_bank_e: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
+                                                 trainable=False)
+        # добавления
+        memory_bank_a: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
+                                                 trainable=False)
+        # сохранения считанных данных
+        memory_bank_r: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
+                                                 trainable=False)
+        prev_memory_bank_r: tf.Variable = tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32,
+                                                      trainable=False)
+
+        # интерполяции
+        # shape = [2], чтобы можно было применять softmax и получать значения на отрезке [0, 1]
+        memory_bank_interpolation_gate: tf.Variable = tf.Variable(initial_value=[0] * 2, dtype=tf.float32,
+                                                                  trainable=False)
+        # сдвига
+        memory_bank_distribution_shifts: tf.Variable = tf.Variable(
+            initial_value=[0] * (2 * memory_number_of_cells - 1),
+            dtype=tf.float32,
+            trainable=False)
+
+        # фокусировки
+        memory_bank_focus_factor: tf.Variable = tf.Variable(initial_value=[0], dtype=tf.float32, trainable=False)
+
+        # контент
+        memory_bank_key_content: tf.Variable = \
+            tf.Variable(initial_value=[0] * memory_cell_length, dtype=tf.float32, trainable=False)
+
+        target_actor = DenseModel(get_actor_dense(), actor_output_length)
+        actor_model = DenseModel(get_actor_dense(), actor_output_length)
+        target_critic = DenseModel(get_critic_dense(), 1)
+        critic_model = DenseModel(get_critic_dense(), 1)
+
+        # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+
+        ddpg: DDPG = DDPG(
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            critic_model_input_concat=lambda state_batch, action_batch:
+            tf.concat(values=[state_batch, action_batch], axis=1)
+        )
+
+        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
+                                                         std_deviation=tf.constant([1.0] * actor_output_length))
+
+        # Генератор бинарной последовательности
+        def binary_sequence_generator(sequence_length: int):
+            for i in range(sequence_length):
+                yield base_block[i % base_block_length]
+
+        accuracy: float = 0
+        history_accuracy: list[float] = []
+        noise_level: float = 0.2
+        noise: Tensor = exploration_noise()
+
+        # инициируем банк памяти
+        i: int = 0
+        e = tf.constant(value=[1] * memory_cell_length, dtype=tf.float32)
+        for c in itertools.combinations_with_replacement([-1, 0, 1], memory_cell_length):
+            w = tf.constant(value=[0 if j != i else 1 for j in range(memory_number_of_cells)],
+                            dtype=tf.float32)
+            a = tf.constant(value=c, dtype=tf.float32)
+            memory_bank.writing(w=w, e=e, a=a)
+            i += 1
+
+        next_bit_prediction: int = 0
+        step: int = 0
+        for bit in binary_sequence_generator(100000):
+            # сбор статистики точности прогнозирования
+            if  step > 0 and bit == next_bit_prediction:
+                accuracy += 1
+
+            if step > 0 and step % 100 == 0:
+                history_accuracy.append(accuracy / 100)
+                accuracy = 0
+                print(sum(history_accuracy) / len(history_accuracy))
+                print(sum(history_accuracy[len(history_accuracy) - 30:]) / len(
+                history_accuracy[len(history_accuracy) - 30:]))
+                print(history_accuracy[len(history_accuracy) - 10:])
+                print(len(history_accuracy))
+
+            step += 1
+
+
+            original_action: Tensor = ddpg.policy(
+                tf.concat(values=(tf.constant(bit, dtype=tf.float32), prev_memory_bank_r), axis=0)
+            )
+
+            #  добавлять шум исследования после разделения действия
+            #  разделяем действие
+            index_from, index_to = 0, 2
+            forecast = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(forecast))
+            forecast += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+            next_bit_prediction = tf.argmax(forecast).numpy()
+
+            index_from, index_to = index_to, index_to + memory_cell_length
+            x = original_action[index_from:index_to]
+            value_max = tf.reduce_max(x)
+            k = tf.reduce_mean(tf.abs(x))
+            x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+            # приводим к [0, 1]
+            value_max = tf.reduce_max(x)
+            memory_bank_e.assign(x * tf.cast(x > 0, tf.float32) / (value_max + tf.keras.backend.epsilon()))
+
+            index_from, index_to = index_to, index_to + memory_cell_length
+            x = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(x))
+            memory_bank_a.assign(x + noise[index_from:index_to] * (k * noise_level if k > 0 else 1))
+
+            # memory_bank_interpolation_gate.shape = [2], для того чтобы можно было применить softmax
+            # и в качестве итогового значения выбрать memory_bank_interpolation_gate[0]
+            index_from, index_to = index_to, index_to + 2
+            x = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(x))
+            x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+            memory_bank_interpolation_gate.assign(tf.reshape(
+                tensor=tf.keras.activations.softmax(tf.reshape(tensor=x, shape=(1, 2))),
+                shape=2))
+
+            index_from, index_to = index_to, index_to + 1
+            x = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(x))
+            x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+            memory_bank_focus_factor.assign(tf.clip_by_value(t=x * tf.cast(x > 0, tf.float32) + 1,
+                                                             clip_value_min=1,
+                                                             clip_value_max=20))
+
+            index_from, index_to = index_to, index_to + 2
+            x = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(x))
+            x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+            x = tf.reshape(
+                tensor=tf.keras.activations.softmax(tf.reshape(tensor=x, shape=(1, index_to - index_from))),
+                shape=index_to - index_from)
+            memory_bank_distribution_shifts[0].assign(x[0])
+            memory_bank_distribution_shifts[1].assign(x[1])
+            memory_bank_distribution_shifts[-1].assign(x[-1])
+
+                    index_from, index_to = index_to, index_to + memory_cell_length
+                    x = original_action[index_from:index_to]
+                    k = tf.reduce_mean(tf.abs(x))
+                    x += noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+                    memory_bank_key_content.assign(x)
+
                     memory_bank.focusing(w_previous=memory_bank_w,
                                          key_content=memory_bank_key_content,
                                          interpolation_gate=memory_bank_interpolation_gate[0],
