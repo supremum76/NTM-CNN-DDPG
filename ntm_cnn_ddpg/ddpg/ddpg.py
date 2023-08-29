@@ -100,7 +100,7 @@ class Buffer:
         record_range = min(self.buffer_counter, self.buffer_capacity)
 
         # Randomly sample indices
-        batch_indices = np.random.choice(record_range, batch_size)
+        batch_indices = np.random.choice(record_range, min(record_range, batch_size))
 
         # collect the batch
         state_batch: Tensor = tf.concat(

@@ -519,8 +519,12 @@ class TestDDPG(TestCase):
             :return: None
             """
 
-        base_block = [random.randint(0, 1) for _ in range(10)]
-        base_block_length: int = len(base_block)
+        # TODO попробовать в качестве памяти использовать ART1 или ART2
+        # TODO попробовать в качестве памяти использовать блок напрямую управляемый агентом.
+        #       Одна ячейка такой памяти соответствует одному выходу нейросети контроллера.
+        base_block = [0] * 25 + [1] * 25
+        random.shuffle(base_block)
+        base_block_length: int = len(base_block) # base_block_length < 100. При 100 агент не обучался, заводя поток примеров в тупик
         memory_size: int = base_block_length
 
         actor_output_length: int = (
@@ -531,6 +535,168 @@ class TestDDPG(TestCase):
             last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
 
             inputs = layers.Input(shape=memory_size)
+            out = layers.Dense(base_block_length, activation="relu", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(base_block_length, activation="relu", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(actor_output_length, activation="linear", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+            return model
+
+        def get_critic_dense():
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            inputs = layers.Input(
+                shape=(
+                    memory_size  # текущее состояние среды
+                    + actor_output_length  # текущее действие актора
+                )
+            )
+            out = layers.Dense(base_block_length, activation="relu", kernel_initializer=last_init)(inputs)
+            out = layers.Dense(base_block_length, activation="relu", kernel_initializer=last_init)(out)
+            outputs = layers.Dense(1, activation="linear", kernel_initializer=last_init)(out)
+
+            model = tf.keras.Model(inputs, outputs)
+
+            return model
+
+        # содаем буфер обучающих примеров
+        buffer: Buffer = Buffer(buffer_capacity=100000)
+
+        target_actor = DenseModel(get_actor_dense(), actor_output_length)
+        actor_model = DenseModel(get_actor_dense(), actor_output_length)
+        target_critic = DenseModel(get_critic_dense(), 1)
+        critic_model = DenseModel(get_critic_dense(), 1)
+
+        # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+
+        ddpg: DDPG = DDPG(
+            target_critic=target_critic,
+            target_actor=target_actor,
+            critic_model=critic_model,
+            actor_model=actor_model,
+            critic_model_input_concat=lambda state_batch, action_batch:
+            tf.concat(values=[state_batch, action_batch], axis=1)
+        )
+
+        exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
+                                                         std_deviation=tf.constant([1.0] * actor_output_length))
+
+        # Генератор бинарной последовательности
+        def binary_sequence_generator(sequence_length: int) -> Iterator[int]:
+            for i in range(sequence_length):
+                yield base_block[i % base_block_length]
+
+        accuracy: float = 0
+        history_accuracy: list[float] = []
+        avg_reward: float = 0
+        noise_level: float = 0.2
+
+        binary_sequence: Iterator[int] = iter(binary_sequence_generator(100000))
+        step: int = 0
+        bit: int = next(binary_sequence)
+        memory = collections.deque([0] * (memory_size - 1), maxlen=memory_size)
+        memory.append(bit)
+        while True:
+            original_action: Tensor = ddpg.policy(state=tf.constant(memory, dtype=tf.float32))
+
+            #  разделяем действие
+            #  добавлять шум исследования после разделения действия
+            index_from, index_to = 0, 2
+            forecast = original_action[index_from:index_to]
+            k = tf.reduce_mean(tf.abs(forecast))
+            noise: Tensor = exploration_noise()
+            noise_forecast = forecast + noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
+
+            forecast = tf.reshape(
+                tensor=tf.keras.activations.softmax(tf.reshape(tensor=noise_forecast, shape=(1, 2))),
+                shape=2
+            )
+            next_bit_prediction: int = tf.argmax(forecast).numpy()
+            next_zero_prediction_prob = forecast[0].numpy()
+
+            try:
+                bit = next(binary_sequence)
+            except StopIteration:
+                break
+
+            prev_memory = memory.copy()
+            memory.popleft()
+            memory.append(bit)
+
+            reward: float = \
+                next_zero_prediction_prob - 0.5 if bit == 0 else (1 - next_zero_prediction_prob) - 0.5
+            avg_reward += reward
+
+            buffer.record(
+                state=tf.constant(prev_memory, dtype=tf.float32),
+                action=noise_forecast,
+                reward=reward,
+                next_state=tf.constant(value=memory, dtype=tf.float32))
+
+            ddpg.learn(buffer=buffer,
+                       batch_size=1000,
+                       epochs=5,
+                       q_learning_discount_factor=0.9,
+                       target_model_update_rate=0.1,
+                       critic_optimizer=critic_optimizer,
+                       actor_optimizer=actor_optimizer
+                       )
+
+            step += 1
+
+            # сбор статистики точности прогнозирования
+            if bit == next_bit_prediction:
+                accuracy += 1
+
+            if step % 100 == 0:
+                history_accuracy.append(accuracy / 100)
+                accuracy = 0
+
+                avg_reward /= 100
+                print(avg_reward)
+                avg_reward = 0
+
+                print(sum(history_accuracy) / len(history_accuracy))
+                print(sum(history_accuracy[len(history_accuracy) - 30:]) / len(
+                    history_accuracy[len(history_accuracy) - 30:]))
+                print(history_accuracy[len(history_accuracy) - 10:])
+                print(len(history_accuracy))
+
+    def _test_binary_sequence_prediction_mlp_esn(self) -> None:
+        """
+            Проверяем связку DDPG+MLP+ESN(на базе LSTM) на "игре", требующей памяти.
+            Например, предсказание бинарной последовательности, являющейся
+            периодическим повторением некоторой однократно случайно сформированной бинарной последовательности заданной
+            длины. Без использования памяти прогноз такой последовательности невозможен.
+            на входе актора ESN-память, на выходе прогноз значения следующего бита.
+            Примеры:
+            01 01 01 0 -> 1
+            100 100 10 -> 0
+            1101 1101 1 -> 1
+
+
+            Необходимо оценить зависимость кол-ва итераций обучения для достижения точности 90% от длины базовой
+            последовательности. Остальные параметры фиксируем.
+            Можно вывести эмприческую аппроксиацию зависимости.
+
+            :return: None
+        """
+
+        base_block = [0]*5 + [1]*5
+        random.shuffle(base_block)
+        base_block_length: int = len(base_block)
+        esn_units: int = int(base_block_length * 2.0)
+
+        actor_output_length: int = (
+            2  # прогноз последовательности (0 или 1)
+        )
+
+        def get_actor_dense():
+            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
+
+            inputs = layers.Input(shape=esn_units)
             out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(inputs)
             out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(out)
             outputs = layers.Dense(actor_output_length, activation="linear", kernel_initializer=last_init)(out)
@@ -543,7 +709,7 @@ class TestDDPG(TestCase):
 
             inputs = layers.Input(
                 shape=(
-                    memory_size  # текущее состояние среды
+                    esn_units  # текущее состояние среды
                     + actor_output_length  # текущее действие актора
                 )
             )
@@ -579,6 +745,8 @@ class TestDDPG(TestCase):
         exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
                                                          std_deviation=tf.constant([1.0] * actor_output_length))
 
+        esn_lstm = tf.keras.layers.LSTM(units=esn_units, stateful=True, trainable=False)
+
         # Генератор бинарной последовательности
         def binary_sequence_generator(sequence_length: int) -> Iterator[int]:
             for i in range(sequence_length):
@@ -586,27 +754,24 @@ class TestDDPG(TestCase):
 
         accuracy: float = 0
         history_accuracy: list[float] = []
+        avg_reward: float = 0
         noise_level: float = 0.2
-        noise: Tensor = exploration_noise()
 
         binary_sequence: Iterator[int] = iter(binary_sequence_generator(100000))
         step: int = 0
         bit: int = next(binary_sequence)
-        memory = collections.deque([0] * (memory_size - 1), maxlen=memory_size)
-        memory.append(bit)
+        esn_output: Tensor = tf.reshape(tensor=esn_lstm(tf.constant(value=[bit], dtype=tf.float32, shape=[1, 1, 1])),
+                                        shape=esn_units)
         while True:
-            original_action: Tensor = ddpg.policy(state=tf.constant(memory, dtype=tf.float32))
+            original_action: Tensor = ddpg.policy(state=esn_output)
 
             #  разделяем действие
             #  добавлять шум исследования после разделения действия
             index_from, index_to = 0, 2
             forecast = original_action[index_from:index_to]
             k = tf.reduce_mean(tf.abs(forecast))
+            noise: Tensor = exploration_noise()
             noise_forecast = forecast + noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
-            """if random.random() < 0.1:
-                noise_forecast = tf.constant(value=[noise_forecast[1].numpy(), noise_forecast[0].numpy()],
-                                             dtype=tf.float32)
-            """
 
             forecast = tf.reshape(
                 tensor=tf.keras.activations.softmax(tf.reshape(tensor=noise_forecast, shape=(1, 2))),
@@ -620,21 +785,23 @@ class TestDDPG(TestCase):
             except StopIteration:
                 break
 
-            prev_memory = memory.copy()
-            memory.popleft()
-            memory.append(bit)
+            prev_esn_output: Tensor = esn_output
+            esn_output = tf.reshape(tensor=esn_lstm(tf.constant(value=[bit], dtype=tf.float32, shape=[1, 1, 1])),
+                                    shape=esn_units)
 
             reward: float = \
                 next_zero_prediction_prob - 0.5 if bit == 0 else (1 - next_zero_prediction_prob) - 0.5
+            avg_reward += reward
+
 
             buffer.record(
-                state=tf.constant(prev_memory, dtype=tf.float32),
+                state=tf.constant(prev_esn_output, dtype=tf.float32),
                 action=noise_forecast,
                 reward=reward,
-                next_state=tf.constant(value=memory, dtype=tf.float32))
+                next_state=tf.constant(value=esn_output, dtype=tf.float32))
 
             ddpg.learn(buffer=buffer,
-                       batch_size=100,
+                       batch_size=200,
                        epochs=5,
                        q_learning_discount_factor=0.9,
                        target_model_update_rate=0.1,
@@ -651,11 +818,17 @@ class TestDDPG(TestCase):
             if step % 100 == 0:
                 history_accuracy.append(accuracy / 100)
                 accuracy = 0
+
+                avg_reward /= 100
+                print(avg_reward)
+                avg_reward = 0
+
                 print(sum(history_accuracy) / len(history_accuracy))
                 print(sum(history_accuracy[len(history_accuracy) - 30:]) / len(
                     history_accuracy[len(history_accuracy) - 30:]))
                 print(history_accuracy[len(history_accuracy) - 10:])
                 print(len(history_accuracy))
+
 
     def _test_binary_sequence_prediction_mlp_ntm(self) -> None:
         """
@@ -676,10 +849,12 @@ class TestDDPG(TestCase):
             :return: None
             """
 
-        base_block = [0, 1]
+        base_block = [0] * 5 + [1] * 5
+        random.shuffle(base_block)
         base_block_length: int = len(base_block)
 
-        memory_number_of_cells: int = 5
+
+        memory_number_of_cells: int = base_block_length
         memory_cell_length: int = base_block_length
         actor_output_length: int = (
                 2  # прогноз последовательности (0 или 1)
@@ -797,7 +972,6 @@ class TestDDPG(TestCase):
         accuracy: float = 0
         history_accuracy: list[float] = []
         noise_level: float = 0.2
-        noise: Tensor = exploration_noise()
 
         # инициируем банк памяти
         i: int = 0
@@ -822,10 +996,9 @@ class TestDDPG(TestCase):
             index_from, index_to = 0, 2
             forecast = original_action[index_from:index_to]
             k = tf.reduce_mean(tf.abs(forecast))
+            noise: Tensor = exploration_noise()
             noise_forecast = forecast + noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
-            if random.random() < 0.1:
-                noise_forecast = tf.constant(value=[noise_forecast[1].numpy(), noise_forecast[0].numpy()],
-                                             dtype=tf.float32)
+
             forecast = tf.reshape(
                 tensor=tf.keras.activations.softmax(tf.reshape(tensor=noise_forecast, shape=(1, 2))),
                 shape=2
@@ -888,12 +1061,6 @@ class TestDDPG(TestCase):
             noise_memory_bank_key_content = x
             memory_bank_key_content.assign(x)
 
-            # TODO попробовать фиксированное управление памятью
-            #  фокусируемся на первой ячейке
-            #  читаем из второй ячейки (prev_memory_bank_r)
-            #  пишем во вторую ячейку, сдвигая вторую позицию в нулевую, а в первую записывая значение текущего бита.
-            #  читаем из второй ячейки (memory_bank_r)
-            #  NTM vs echo-net (на клеточных автоматах)  ???
             memory_bank.focusing(w_previous=memory_bank_w,
                                  key_content=memory_bank_key_content,
                                  interpolation_gate=memory_bank_interpolation_gate[0],
@@ -929,7 +1096,7 @@ class TestDDPG(TestCase):
                 next_state=tf.concat(values=(tf.constant([bit], dtype=tf.float32), memory_bank_r), axis=0))
 
             ddpg.learn(buffer=buffer,
-                       batch_size=10,
+                       batch_size=100,
                        epochs=5,
                        q_learning_discount_factor=0.9,
                        target_model_update_rate=0.1,
@@ -955,5 +1122,6 @@ class TestDDPG(TestCase):
     def test_learn(self):
         # self._test_tic_tac_toe_without_ntm()
         # self._test_tic_tac_toe_mlp_ntm()
-        # self._test_binary_sequence_prediction_mlp_ntm()
         self._test_binary_sequence_prediction_mlp()
+        # self._test_binary_sequence_prediction_mlp_ntm()
+        # self._test_binary_sequence_prediction_mlp_esn()
