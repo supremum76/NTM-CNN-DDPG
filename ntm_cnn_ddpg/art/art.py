@@ -67,7 +67,10 @@ class ART:
         Единственная  возможная причина этого, на вход подан нулевой или близкий к нулю вектор.
         """
         _input: Tensor = args[0]
-        # TODO проверить размер входящего вектора
+
+        if _input.shape.dims != 1 or _input.shape[0] != self.input_size:
+            raise ValueError(f"A tensor of shape ({self.input_size}) "
+                             f"was expected. Shape tensor obtained {_input.shape}.")
 
         input_norm: Tensor = tf.norm(_input)
         if math.isclose(input_norm.numpy(), 0.0, rel_tol=1E-10, abs_tol=1E-10):
