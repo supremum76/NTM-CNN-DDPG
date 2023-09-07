@@ -11,6 +11,7 @@
     1) S. Grossberg, Adaptive pattern classification and universal recoding. II. Feedback, expectation, olfaction, and
     illusions, Bioi. Cybemet. 23, 1976, 187-202.
 """
+import math
 
 import tensorflow as tf
 from tensorflow import Tensor
@@ -41,6 +42,10 @@ class ART:
     2) G. A.Carpenter, S. Grossberg, A massively parallel architecture for a self-organizing neural pattern recognition
     machine, Computer Vision, Graphics, and Image Processing, Vol. 37, Issue 1,1987, 54-115.
     """
+
+    recognition_codes: list[Tensor] = []  # коды распознавания
+    recognition_codes_norm: list[Tensor] = []  # предрасчитанная норма кодов распознавания
+
     def __init__(self, init_input_size: int, similarity_threshold: float):
         """
         Инициирование ART-сети.
@@ -63,4 +68,31 @@ class ART:
         """
         _input: Tensor = args[0]
         # TODO проверить размер входящего вектора
-        return 0, False
+
+        input_norm: Tensor = tf.norm(_input)
+        if math.isclose(input_norm.numpy(), 0.0, rel_tol=1E-10, abs_tol=1E-10):
+            return -1, False
+
+        code_index: int = -1
+        max_cosine_similarity: Tensor | None = None
+        new_code: bool = False
+        for i in range(len(self.recognition_codes)):
+            code: Tensor = self.recognition_codes[i]
+            code_norm: Tensor = self.recognition_codes_norm[i]
+            cosine_similarity: Tensor = tf.reduce_sum(_input * code) / (input_norm * code_norm
+                                                                        + tf.keras.backend.epsilon())
+            if i > 0:
+                if cosine_similarity > max_cosine_similarity:
+                    max_cosine_similarity = cosine_similarity
+                    code_index = i
+            else:
+                max_cosine_similarity = cosine_similarity
+                code_index = 0
+
+        if (code_index >= 0 and max_cosine_similarity.numpy() < self.similarity_threshold) or (code_index == -1):
+            self.recognition_codes.append(tf.constant(value=_input))
+            self.recognition_codes_norm.append(input_norm)
+            code_index = len(self.recognition_codes) - 1
+            new_code = True
+
+        return code_index, new_code
