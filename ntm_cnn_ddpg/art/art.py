@@ -93,9 +93,13 @@ class ART:
                 code_index = 0
 
         if (code_index >= 0 and max_cosine_similarity.numpy() < self.similarity_threshold) or (code_index == -1):
+            # создаем новый код распознавания
             self.recognition_codes.append(tf.constant(value=_input))
             self.recognition_codes_norm.append(input_norm)
             code_index = len(self.recognition_codes) - 1
             new_code = True
+        else:
+            #  TODO корректируем выбранный код распознавания
+            pass
 
         return code_index, new_code
