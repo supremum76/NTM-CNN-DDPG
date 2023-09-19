@@ -5,7 +5,7 @@ import random
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
-from typing import Iterator
+from typing import Iterator, Sequence
 from unittest import TestCase
 
 import tensorflow as tf
@@ -664,13 +664,14 @@ class TestDDPG(TestCase):
                 print(history_accuracy[len(history_accuracy) - 10:])
                 print(len(history_accuracy))
 
-    def _test_binary_sequence_prediction_mlp_esn(self) -> None:
+    def _test_binary_sequence_prediction_mlp_lstm(self) -> None:
         """
-            Проверяем связку DDPG+MLP+ESN(на базе LSTM) на "игре", требующей памяти.
+            Проверяем связку DDPG+MLP+LSTM на "игре", требующей памяти.
             Например, предсказание бинарной последовательности, являющейся
             периодическим повторением некоторой однократно случайно сформированной бинарной последовательности заданной
             длины. Без использования памяти прогноз такой последовательности невозможен.
-            на входе актора ESN-память, на выходе прогноз значения следующего бита.
+            на входе актора ограниченная история бинарной последовательности,
+            на выходе прогноз значения следующего бита.
             Примеры:
             01 01 01 0 -> 1
             100 100 10 -> 0
@@ -687,37 +688,46 @@ class TestDDPG(TestCase):
         base_block = [0]*5 + [1]*5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
-        esn_units: int = int(base_block_length * 2.0)
+        # История бинарной последовательности ограниченным окном.
+        # Проверяем, что LSTM способна прогнозировать такие последовательности.
+        sequence_history_window: collections.deque = collections.deque([], base_block_length * 10)
+        lstm_units: int = base_block_length
+        lstm_dropout: float = 0.0
 
         actor_output_length: int = (
             2  # прогноз последовательности (0 или 1)
         )
 
-        def get_actor_dense():
-            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
-
-            inputs = layers.Input(shape=esn_units)
-            out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(inputs)
-            out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(out)
-            outputs = layers.Dense(actor_output_length, activation="linear", kernel_initializer=last_init)(out)
+        def get_actor_model():
+            inputs = layers.Input(
+                None,  # time
+                shape=1  # за раз обрабатываем один бит из истории последовательности
+            )
+            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(inputs)
+            outputs = layers.Dense(actor_output_length, activation="linear")(out)
 
             model = tf.keras.Model(inputs, outputs)
             return model
 
-        def get_critic_dense():
-            last_init = tf.random_uniform_initializer(minval=-1E-0, maxval=1E-0)
-
-            inputs = layers.Input(
+        def get_critic_model():
+            sequence_history = layers.Input(
                 shape=(
-                    esn_units  # текущее состояние среды
-                    + actor_output_length  # текущее действие актора
+                    None,  # time
+                    1  # за раз обрабатываем один бит из истории последовательности
                 )
             )
-            out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(inputs)
-            out = layers.Dense(10, activation="relu", kernel_initializer=last_init)(out)
-            outputs = layers.Dense(1, activation="linear", kernel_initializer=last_init)(out)
 
-            model = tf.keras.Model(inputs, outputs)
+            action = layers.Input(
+                shape=actor_output_length  # текущее действие актора
+            )
+
+            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(
+                sequence_history)
+            out = tf.keras.layers.Concatenate()([out, action])
+            out = layers.Dense(lstm_units, activation="linear")(out)
+            outputs = layers.Dense(1, activation="linear")(out)
+
+            model = tf.keras.Model([sequence_history, action], outputs)
 
             return model
 
