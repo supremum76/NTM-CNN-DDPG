@@ -6,12 +6,20 @@ https://keras.io/examples/rl/ddpg_pendulum/#introduction
 https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
-from typing import Callable
+import collections.abc
+from typing import Callable, Sequence
 
 import numpy as np
 import tensorflow as tf
 
-from ntm_cnn_ddpg.cnn.model import Model, Tensor
+from ntm_cnn_ddpg.cnn.model import Tensor, OptionalSeqTensors, SeqTensors, CriticModel, ActorModel
+
+
+def _tensors_to_seq_tensors(tensors: OptionalSeqTensors) -> SeqTensors:
+    if isinstance(tensors, collections.abc.Sequence):
+        return tensors
+    else:
+        return [tensors]
 
 
 class OUActionNoise:
@@ -60,12 +68,13 @@ class Buffer:
         # Its tells us num of times record() was called.
         self.buffer_counter = 0
 
-        self.state_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
-        self.action_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
-        self.reward_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
-        self.next_state_buffer: list[Tensor | None] = [None for _ in range(self.buffer_capacity)]
+        self.state_buffer: list[OptionalSeqTensors | None] = [None for _ in range(self.buffer_capacity)]
+        self.action_buffer: list[OptionalSeqTensors | None] = [None for _ in range(self.buffer_capacity)]
+        self.reward_buffer: list[OptionalSeqTensors | None] = [None for _ in range(self.buffer_capacity)]
+        self.next_state_buffer: list[OptionalSeqTensors | None] = [None for _ in range(self.buffer_capacity)]
 
-    def record(self, state: Tensor, action: Tensor, reward: float, next_state: Tensor) -> None:
+    def record(self, state: OptionalSeqTensors, action: OptionalSeqTensors, reward: float,
+               next_state: OptionalSeqTensors) -> None:
         """
         Takes and remember state, action, reward and next state
         :param state: state environment
@@ -78,17 +87,20 @@ class Buffer:
         # replacing old records
         index: int = self.buffer_counter % self.buffer_capacity
 
-        self.state_buffer[index] = tf.cast(state, tf.float32)
-        self.action_buffer[index] = tf.cast(action, tf.float32)
+        self.state_buffer[index] = tuple(
+            map(lambda tensor: tf.cast(tensor, tf.float32), _tensors_to_seq_tensors(state)))
+        self.action_buffer[index] = tuple(
+            map(lambda tensor: tf.cast(tensor, tf.float32), _tensors_to_seq_tensors(action)))
         self.reward_buffer[index] = tf.constant(reward, tf.float32)
-        self.next_state_buffer[index] = tf.cast(next_state, tf.float32)
+        self.next_state_buffer[index] = tuple(
+            map(lambda tensor: tf.cast(tensor, tf.float32), _tensors_to_seq_tensors(next_state)))
 
         self.buffer_counter += 1
         if self.buffer_counter == self.buffer_capacity * 2:
             self.buffer_counter = self.buffer_capacity
 
     def new_batch_records(self, batch_size: int, only_state_batch: bool) \
-            -> tuple[Tensor, Tensor, Tensor, Tensor] | Tensor:
+            -> tuple[OptionalSeqTensors, OptionalSeqTensors, Tensor, OptionalSeqTensors] | OptionalSeqTensors:
         """
         Return a new randomized batch of records for models learn
         :param batch_size: batch size
@@ -103,45 +115,55 @@ class Buffer:
         batch_indices = np.random.choice(record_range, min(record_range, batch_size))
 
         # collect the batch
-        state_batch: Tensor = tf.concat(
-            values=[tf.reshape(self.state_buffer[i], [1, *self.state_buffer[i].shape])
-                    for i in batch_indices],
-            axis=0)
+        state_tensors_count: int = len(self.state_buffer[0])
+        state_batch: OptionalSeqTensors = []
+        for k in range(state_tensors_count):
+            state_batch.append(tf.concat(
+                values=[tf.reshape(self.state_buffer[k][i], [1, *self.state_buffer[k][i].shape])
+                        for i in batch_indices],
+                axis=0))
 
         if only_state_batch:
             return state_batch
         else:
-            action_batch: Tensor = tf.concat(
-                values=[tf.reshape(self.action_buffer[i], [1, *self.action_buffer[i].shape])
-                        for i in batch_indices],
-                axis=0)
+            action_tensors_count: int = len(self.action_buffer[0])
+            action_batch: OptionalSeqTensors = []
+            for k in range(action_tensors_count):
+                action_batch.append(tf.concat(
+                    values=[tf.reshape(self.action_buffer[k][i], [1, *self.action_buffer[k][i].shape])
+                            for i in batch_indices],
+                    axis=0))
 
             reward_batch: Tensor = tf.concat(values=[tf.reshape(self.reward_buffer[i], [1, 1])
                                                      for i in batch_indices],
                                              axis=0)
-            next_state_batch: Tensor = tf.concat(values=[tf.reshape(self.next_state_buffer[i],
-                                                                    [1, *self.next_state_buffer[i].shape])
-                                                         for i in batch_indices],
-                                                 axis=0)
+
+            next_state_batch: OptionalSeqTensors = []
+            for k in range(state_tensors_count):
+                next_state_batch.append(tf.concat(
+                    values=[tf.reshape(self.next_state_buffer[k][i], [1, *self.next_state_buffer[k][i].shape])
+                            for i in batch_indices],
+                    axis=0))
 
             return state_batch, action_batch, reward_batch, next_state_batch
 
 
 class DDPG:
     def __init__(self,
-                 target_critic: Model,
-                 target_actor: Model,
-                 critic_model: Model,
-                 actor_model: Model,
-                 critic_model_input_concat: Callable[[Tensor, Tensor], Tensor]):
+                 target_critic: CriticModel,
+                 target_actor: ActorModel,
+                 critic_model: CriticModel,
+                 actor_model: ActorModel,
+                 critic_model_input_concat: Callable[[OptionalSeqTensors, OptionalSeqTensors],
+                                                     OptionalSeqTensors]):
         """
         Инициализация
         :param target_critic: Целевая модель критика
         :param target_actor: Целевая модель актора
         :param critic_model: Модель критика
         :param actor_model: Модель актора
-        :param critic_model_input_concat: Функция, объединяющая тензор состояния и тензор действия в единый тензор
-        входа для модели критика. Интерфейс функции (state batch, action batch) -> critic model input batch.
+        :param critic_model_input_concat: Функция, объединяющая тензоры состояния и тензоры действия во
+        вход для модели критика. Интерфейс функции (state batch, action batch) -> critic model input batch.
         """
         self.target_critic = target_critic
         self.target_actor = target_actor
@@ -149,7 +171,7 @@ class DDPG:
         self.actor_model = actor_model
         self.critic_model_input_concat = critic_model_input_concat
 
-    def policy(self, state: Tensor) -> Tensor:
+    def policy(self, state: OptionalSeqTensors) -> OptionalSeqTensors:
         """
          Returns an action sampled from our Actor network
         :param state: State
@@ -189,7 +211,7 @@ class DDPG:
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
     @tf.function
     def _update_critic_model(
-            self, state_batch: Tensor, action_batch: Tensor, reward_batch: Tensor, next_state_batch: Tensor,
+            self, state_batch: OptionalSeqTensors, action_batch: OptionalSeqTensors, reward_batch: Tensor, next_state_batch: OptionalSeqTensors,
             critic_optimizer: tf.optimizers.Optimizer,
             q_learning_discount_factor: Tensor
     ):
@@ -216,7 +238,7 @@ class DDPG:
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
     @tf.function
-    def _update_actor_model(self, state_batch: Tensor, actor_optimizer: tf.optimizers.Optimizer):
+    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer):
         # Training and updating Actor network.
         with tf.GradientTape(watch_accessed_variables=False) as tape:
             for t in self.actor_model.trainable_variables:

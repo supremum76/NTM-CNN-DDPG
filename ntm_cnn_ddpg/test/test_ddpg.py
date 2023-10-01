@@ -12,7 +12,7 @@ import tensorflow as tf
 from keras import layers
 from keras.optimizers import Optimizer
 
-from ntm_cnn_ddpg.cnn.model import Tensor, Model
+from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel, CriticModel
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
 from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
 from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
@@ -42,6 +42,51 @@ class DenseModel(Model):
     def predict(self, model_input: Tensor, training: bool) -> Tensor:
         batch_mode: bool = model_input.shape.ndims == 2
 
+        result: Tensor = self.__model(inputs=
+                                      model_input if batch_mode else
+                                      # добавляем фиктивное измерение пакета
+                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
+                                      training=training)
+        if not batch_mode:
+            # удаляем фиктивное измерение пакета
+            result = tf.reshape(tensor=result, shape=self.output_length)
+
+        return result
+
+    @property
+    def trainable_variables(self) -> Tensor:
+        return self.__model.trainable_variables
+
+
+class TestActorModel(ActorModel):
+    def __init__(self, tf_model, output_length):
+        self.__model = tf_model
+        self.output_length = output_length
+
+    def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
+            Tensor | Sequence[Tensor]:
+        result: Tensor = self.__model(inputs=
+                                      model_input if batch_mode else
+                                      # добавляем фиктивное измерение пакета
+                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
+                                      training=training)
+        if not batch_mode:
+            # удаляем фиктивное измерение пакета
+            result = tf.reshape(tensor=result, shape=self.output_length)
+
+        return result
+
+    @property
+    def trainable_variables(self) -> Tensor:
+        return self.__model.trainable_variables
+
+
+class TestCriticModel(CriticModel):
+    def __init__(self, tf_model, output_length):
+        self.__model = tf_model
+        self.output_length = output_length
+
+    def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> Tensor:
         result: Tensor = self.__model(inputs=
                                       model_input if batch_mode else
                                       # добавляем фиктивное измерение пакета
@@ -524,7 +569,8 @@ class TestDDPG(TestCase):
         #       Одна ячейка такой памяти соответствует одному выходу нейросети контроллера.
         base_block = [0] * 25 + [1] * 25
         random.shuffle(base_block)
-        base_block_length: int = len(base_block) # base_block_length < 100. При 100 агент не обучался, заводя поток примеров в тупик
+        base_block_length: int = len(
+            base_block)  # base_block_length < 100. При 100 агент не обучался, заводя поток примеров в тупик
         memory_size: int = base_block_length
 
         actor_output_length: int = (
@@ -547,8 +593,8 @@ class TestDDPG(TestCase):
 
             inputs = layers.Input(
                 shape=(
-                    memory_size  # текущее состояние среды
-                    + actor_output_length  # текущее действие актора
+                        memory_size  # текущее состояние среды
+                        + actor_output_length  # текущее действие актора
                 )
             )
             out = layers.Dense(base_block_length, activation="relu", kernel_initializer=last_init)(inputs)
@@ -685,7 +731,7 @@ class TestDDPG(TestCase):
             :return: None
         """
 
-        base_block = [0]*5 + [1]*5
+        base_block = [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
@@ -698,12 +744,13 @@ class TestDDPG(TestCase):
             2  # прогноз последовательности (0 или 1)
         )
 
-        def get_actor_model():
+        def get_actor_model(lstm_stateful: bool):
             inputs = layers.Input(
                 None,  # time
                 shape=1  # за раз обрабатываем один бит из истории последовательности
             )
-            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(inputs)
+            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout,
+                                       stateful=lstm_stateful)(inputs)
             outputs = layers.Dense(actor_output_length, activation="linear")(out)
 
             model = tf.keras.Model(inputs, outputs)
@@ -734,10 +781,10 @@ class TestDDPG(TestCase):
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
-        target_actor = DenseModel(get_actor_dense(), actor_output_length)
-        actor_model = DenseModel(get_actor_dense(), actor_output_length)
-        target_critic = DenseModel(get_critic_dense(), 1)
-        critic_model = DenseModel(get_critic_dense(), 1)
+        target_actor = TestActorModel(get_actor_model(lstm_stateful=True), actor_output_length)
+        actor_model = TestActorModel(get_actor_model(lstm_stateful=False), actor_output_length)
+        target_critic = TestCriticModel(get_critic_model(), 1)
+        critic_model = TestCriticModel(get_critic_model(), 1)
 
         # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
@@ -748,14 +795,11 @@ class TestDDPG(TestCase):
             target_actor=target_actor,
             critic_model=critic_model,
             actor_model=actor_model,
-            critic_model_input_concat=lambda state_batch, action_batch:
-            tf.concat(values=[state_batch, action_batch], axis=1)
+            critic_model_input_concat=lambda state_batch, action_batch: [state_batch, action_batch]
         )
 
         exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
                                                          std_deviation=tf.constant([1.0] * actor_output_length))
-
-        esn_lstm = tf.keras.layers.LSTM(units=esn_units, stateful=True, trainable=False)
 
         # Генератор бинарной последовательности
         def binary_sequence_generator(sequence_length: int) -> Iterator[int]:
@@ -768,15 +812,18 @@ class TestDDPG(TestCase):
         noise_level: float = 0.2
 
         binary_sequence: Iterator[int] = iter(binary_sequence_generator(100000))
+        # наполняем sequence_history_window
+        for _ in range(sequence_history_window.maxlen):
+            sequence_history_window.append(next(binary_sequence))
         step: int = 0
         bit: int = next(binary_sequence)
-        esn_output: Tensor = tf.reshape(tensor=esn_lstm(tf.constant(value=[bit], dtype=tf.float32, shape=[1, 1, 1])),
-                                        shape=esn_units)
+        sequence_history_window.append(bit)
+
         while True:
-            original_action: Tensor = ddpg.policy(state=esn_output)
+            original_action: Tensor = ddpg.policy(state=bit)
 
             #  разделяем действие
-            #  добавлять шум исследования после разделения действия
+            #  добавляем шум исследования после разделения действия
             index_from, index_to = 0, 2
             forecast = original_action[index_from:index_to]
             k = tf.reduce_mean(tf.abs(forecast))
@@ -790,25 +837,25 @@ class TestDDPG(TestCase):
             next_bit_prediction: int = tf.argmax(forecast).numpy()
             next_zero_prediction_prob = forecast[0].numpy()
 
+            prev_state = sequence_history_window.copy()
             try:
                 bit = next(binary_sequence)
+                sequence_history_window.append(bit)
             except StopIteration:
                 break
-
-            prev_esn_output: Tensor = esn_output
-            esn_output = tf.reshape(tensor=esn_lstm(tf.constant(value=[bit], dtype=tf.float32, shape=[1, 1, 1])),
-                                    shape=esn_units)
 
             reward: float = \
                 next_zero_prediction_prob - 0.5 if bit == 0 else (1 - next_zero_prediction_prob) - 0.5
             avg_reward += reward
 
-
+            # представляем состояние (историю бинарной последовательности) как временную последовательность
             buffer.record(
-                state=tf.constant(prev_esn_output, dtype=tf.float32),
+                state=tf.constant(value=prev_state, dtype=tf.float32, shape=(len(prev_state), 1)),
                 action=noise_forecast,
                 reward=reward,
-                next_state=tf.constant(value=esn_output, dtype=tf.float32))
+                next_state=tf.constant(value=sequence_history_window, dtype=tf.float32,
+                                       shape=(len(sequence_history_window), 1)),
+            )
 
             ddpg.learn(buffer=buffer,
                        batch_size=200,
@@ -839,7 +886,6 @@ class TestDDPG(TestCase):
                 print(history_accuracy[len(history_accuracy) - 10:])
                 print(len(history_accuracy))
 
-
     def _test_binary_sequence_prediction_mlp_ntm(self) -> None:
         """
             Проверяем связку DDPG+MLP+NTM на "игре", требующей памяти.
@@ -862,7 +908,6 @@ class TestDDPG(TestCase):
         base_block = [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
-
 
         memory_number_of_cells: int = base_block_length
         memory_cell_length: int = base_block_length

@@ -1,10 +1,9 @@
 from abc import ABC, abstractmethod
 
-import tensorflow as tf
-
-Tensor = tf.Tensor
+from ntm_cnn_ddpg.ddpg.ddpg import OptionalSeqTensors
 
 
+# TODO внедрить использование класса в классы Buffer и DDPG
 class State(ABC):
     """
     Абстрактнвый класс для хранения состояния среды в Q-learning алгоритмах, использующих буфер примеров
@@ -20,8 +19,9 @@ class State(ABC):
     список ссылок на состояния исходной среды. Непосредственно перед подачей истории на вход модели
     (например, модели типа LSTM), историю необходимо преобразовать в числовую матрицу.
     """
+
     @abstractmethod
-    def to_actor_model_input_tensor(self) -> tuple[Tensor]:
+    def to_actor_model_input_tensor(self) -> OptionalSeqTensors:
         """
         Приведение состояния среды в формат набора тензоров,
         подходящий для подачи на вход actor модели без сложных преобразований.
