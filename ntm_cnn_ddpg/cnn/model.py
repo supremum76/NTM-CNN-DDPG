@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from collections import Sequence
+from typing import Sequence
 
 import tensorflow as tf
 

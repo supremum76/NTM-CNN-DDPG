@@ -746,8 +746,11 @@ class TestDDPG(TestCase):
 
         def get_actor_model(lstm_stateful: bool):
             inputs = layers.Input(
-                None,  # time
-                shape=1  # за раз обрабатываем один бит из истории последовательности
+                shape=(
+                    None,  # time
+                    1  # за раз обрабатываем один бит из истории последовательности
+                ),
+                batch_size=1 if lstm_stateful else None
             )
             out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout,
                                        stateful=lstm_stateful)(inputs)
@@ -820,7 +823,7 @@ class TestDDPG(TestCase):
         sequence_history_window.append(bit)
 
         while True:
-            original_action: Tensor = ddpg.policy(state=bit)
+            original_action: Tensor = ddpg.policy(state=tf.constant(bit, dtype=tf.float32, shape=(1, 1)))
 
             #  разделяем действие
             #  добавляем шум исследования после разделения действия
@@ -1175,8 +1178,8 @@ class TestDDPG(TestCase):
                 print(len(history_accuracy))
 
     def test_learn(self):
+        self._test_binary_sequence_prediction_mlp_lstm()
         # self._test_tic_tac_toe_without_ntm()
         # self._test_tic_tac_toe_mlp_ntm()
-        self._test_binary_sequence_prediction_mlp()
+        # self._test_binary_sequence_prediction_mlp()
         # self._test_binary_sequence_prediction_mlp_ntm()
-        # self._test_binary_sequence_prediction_mlp_esn()

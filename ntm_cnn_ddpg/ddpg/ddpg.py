@@ -119,7 +119,7 @@ class Buffer:
         state_batch: OptionalSeqTensors = []
         for k in range(state_tensors_count):
             state_batch.append(tf.concat(
-                values=[tf.reshape(self.state_buffer[k][i], [1, *self.state_buffer[k][i].shape])
+                values=[tf.reshape(self.state_buffer[i][k], [1, *self.state_buffer[i][k].shape])
                         for i in batch_indices],
                 axis=0))
 
@@ -130,7 +130,7 @@ class Buffer:
             action_batch: OptionalSeqTensors = []
             for k in range(action_tensors_count):
                 action_batch.append(tf.concat(
-                    values=[tf.reshape(self.action_buffer[k][i], [1, *self.action_buffer[k][i].shape])
+                    values=[tf.reshape(self.action_buffer[i][k], [1, *self.action_buffer[i][k].shape])
                             for i in batch_indices],
                     axis=0))
 
@@ -141,7 +141,7 @@ class Buffer:
             next_state_batch: OptionalSeqTensors = []
             for k in range(state_tensors_count):
                 next_state_batch.append(tf.concat(
-                    values=[tf.reshape(self.next_state_buffer[k][i], [1, *self.next_state_buffer[k][i].shape])
+                    values=[tf.reshape(self.next_state_buffer[i][k], [1, *self.next_state_buffer[i][k].shape])
                             for i in batch_indices],
                     axis=0))
 
@@ -177,7 +177,7 @@ class DDPG:
         :param state: State
         :return: Action
         """
-        return self.actor_model.predict(model_input=state, training=False)
+        return self.actor_model.predict(model_input=state, training=False, batch_mode=False)
 
     def learn(self, buffer: Buffer, batch_size: int, epochs: int,
               q_learning_discount_factor: float,
