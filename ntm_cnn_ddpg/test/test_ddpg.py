@@ -12,7 +12,7 @@ import tensorflow as tf
 from keras import layers
 from keras.optimizers import Optimizer
 
-from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel, CriticModel
+from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel as DDPGActorModel, CriticModel as DDPGCriticModel
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
 from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
 from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
@@ -42,51 +42,6 @@ class DenseModel(Model):
     def predict(self, model_input: Tensor, training: bool) -> Tensor:
         batch_mode: bool = model_input.shape.ndims == 2
 
-        result: Tensor = self.__model(inputs=
-                                      model_input if batch_mode else
-                                      # добавляем фиктивное измерение пакета
-                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
-                                      training=training)
-        if not batch_mode:
-            # удаляем фиктивное измерение пакета
-            result = tf.reshape(tensor=result, shape=self.output_length)
-
-        return result
-
-    @property
-    def trainable_variables(self) -> Tensor:
-        return self.__model.trainable_variables
-
-
-class TestActorModel(ActorModel):
-    def __init__(self, tf_model, output_length):
-        self.__model = tf_model
-        self.output_length = output_length
-
-    def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
-            Tensor | Sequence[Tensor]:
-        result: Tensor = self.__model(inputs=
-                                      model_input if batch_mode else
-                                      # добавляем фиктивное измерение пакета
-                                      tf.reshape(tensor=model_input, shape=(1, *model_input.shape)),
-                                      training=training)
-        if not batch_mode:
-            # удаляем фиктивное измерение пакета
-            result = tf.reshape(tensor=result, shape=self.output_length)
-
-        return result
-
-    @property
-    def trainable_variables(self) -> Tensor:
-        return self.__model.trainable_variables
-
-
-class TestCriticModel(CriticModel):
-    def __init__(self, tf_model, output_length):
-        self.__model = tf_model
-        self.output_length = output_length
-
-    def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> Tensor:
         result: Tensor = self.__model(inputs=
                                       model_input if batch_mode else
                                       # добавляем фиктивное измерение пакета
@@ -744,50 +699,151 @@ class TestDDPG(TestCase):
             2  # прогноз последовательности (0 или 1)
         )
 
-        def get_actor_model(lstm_stateful: bool):
-            inputs = layers.Input(
-                shape=(
-                    None,  # time
-                    1  # за раз обрабатываем один бит из истории последовательности
-                ),
-                batch_size=1 if lstm_stateful else None
-            )
-            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout,
-                                       stateful=lstm_stateful)(inputs)
-            outputs = layers.Dense(actor_output_length, activation="linear")(out)
-
-            model = tf.keras.Model(inputs, outputs)
-            return model
-
-        def get_critic_model():
-            sequence_history = layers.Input(
-                shape=(
-                    None,  # time
-                    1  # за раз обрабатываем один бит из истории последовательности
+        # TODO не выделять TargetActorModel и ActorModel. TargetActorModel => ActorModel
+        class TargetActorModel(DDPGActorModel):
+            def __init__(self):
+                inputs = layers.Input(
+                    shape=(
+                        None,  # time
+                        1  # за раз обрабатываем один бит из истории последовательности
+                    )
                 )
-            )
 
-            action = layers.Input(
-                shape=actor_output_length  # текущее действие актора
-            )
+                lstm_initial_memory_state = layers.Input((lstm_units,))
+                lstm_initial_carry_state = layers.Input((lstm_units,))
 
-            out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(
-                sequence_history)
-            out = tf.keras.layers.Concatenate()([out, action])
-            out = layers.Dense(lstm_units, activation="linear")(out)
-            outputs = layers.Dense(1, activation="linear")(out)
+                lstm_out, lstm_final_memory_state, lstm_final_carry_state = (
+                    tf.keras.layers.LSTM(units=lstm_units,
+                                         dropout=lstm_dropout,
+                                         recurrent_dropout=lstm_dropout,
+                                         return_state=True)
+                    (inputs, initial_state=[lstm_initial_memory_state, lstm_initial_carry_state]))
 
-            model = tf.keras.Model([sequence_history, action], outputs)
+                outputs = layers.Dense(actor_output_length, activation="elu")(lstm_out)
 
-            return model
+                model = tf.keras.Model(inputs=[inputs, lstm_initial_memory_state, lstm_initial_carry_state],
+                                       outputs=[outputs, lstm_final_memory_state, lstm_final_carry_state])
+
+                self.__model = model
+                self.output_length = actor_output_length
+                self.__lstm_memory_state = tf.constant([0] * lstm_units, dtype=tf.float32, shape=(1, lstm_units))
+                self.__lstm_carry_state = tf.constant([0] * lstm_units, dtype=tf.float32, shape=(1, lstm_units))
+
+            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
+                    Tensor | Sequence[Tensor]:
+
+                online_mode: bool = not batch_mode
+
+                lstm_init_memory_state: tf.Tensor = self.__lstm_memory_state
+                lstm_init_carry_state: tf.Tensor = self.__lstm_carry_state
+
+                # в пакетном режиме используем нулевое начальное состояние lstm-слоя
+                if batch_mode:
+                    batch_size: int = model_input[0].shape[0] if isinstance(model_input, Sequence) \
+                        else model_input.shape[0]
+                    lstm_batch_init_memory_state: tf.Tensor = (
+                        tf.constant([0] * lstm_units * batch_size, dtype=tf.float32,
+                                    shape=(batch_size, lstm_units)))
+
+                    lstm_init_memory_state = lstm_batch_init_memory_state
+                    lstm_init_carry_state = lstm_batch_init_memory_state
+
+                result, lstm_final_memory_state, lstm_final_carry_state = (
+                    self.__model(inputs=[model_input if batch_mode else
+                                         # добавляем фиктивное измерение пакета
+                                         tf.reshape(tensor=model_input, shape=(1, *model_input.shape))
+                                         if not isinstance(model_input, Sequence)
+                                         else [tf.reshape(tensor=t, shape=(1, *t.shape)) for t in model_input],
+                                         lstm_init_memory_state,
+                                         lstm_init_carry_state],
+                                 training=training))
+
+                if online_mode:
+                    # удаляем фиктивное измерение пакета
+                    result = tf.reshape(tensor=result, shape=self.output_length)
+                    # запоминаем новое состояние lstm-слоя только в online-режиме
+                    self.__lstm_memory_state = lstm_final_memory_state
+                    self.__lstm_carry_state = lstm_final_carry_state
+
+                return result
+
+            @property
+            def trainable_variables(self) -> Tensor:
+                return self.__model.trainable_variables
+
+        class ActorModel(DDPGActorModel):
+            def __init__(self):
+                inputs = layers.Input(
+                    shape=(
+                        None,  # time
+                        1  # за раз обрабатываем один бит из истории последовательности
+                    )
+                )
+
+                lstm_out = (
+                    tf.keras.layers.LSTM(units=lstm_units,
+                                         dropout=lstm_dropout,
+                                         recurrent_dropout=lstm_dropout,
+                                         return_state=False)(inputs))
+
+                outputs = layers.Dense(actor_output_length, activation="elu")(lstm_out)
+
+                model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+                self.__model = model
+                self.output_length = actor_output_length
+
+            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
+                    Tensor | Sequence[Tensor]:
+
+                result = (self.__model(inputs=model_input, training=training))
+
+                return result
+
+            @property
+            def trainable_variables(self) -> Tensor:
+                return self.__model.trainable_variables
+
+        class CriticModel(DDPGCriticModel):
+            def __init__(self):
+                sequence_history = layers.Input(
+                    shape=(
+                        None,  # time
+                        1  # за раз обрабатываем один бит из истории последовательности
+                    )
+                )
+
+                action = layers.Input(
+                    shape=actor_output_length  # текущее действие актора
+                )
+
+                out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(
+                    sequence_history)
+                out = tf.keras.layers.Concatenate()([out, action])
+                out = layers.Dense(lstm_units, activation="elu")(out)
+                outputs = layers.Dense(1, activation="elu")(out)
+
+                model = tf.keras.Model([sequence_history, action], outputs)
+
+                self.__model = model
+                self.output_length = 1
+
+            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool,
+                        batch_mode: bool = True) -> Tensor:
+                # TODO action shape=(1, 1, 2) ???
+                return self.__model(inputs=model_input, training=training)
+
+            @property
+            def trainable_variables(self) -> Tensor:
+                return self.__model.trainable_variables
 
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
-        target_actor = TestActorModel(get_actor_model(lstm_stateful=True), actor_output_length)
-        actor_model = TestActorModel(get_actor_model(lstm_stateful=False), actor_output_length)
-        target_critic = TestCriticModel(get_critic_model(), 1)
-        critic_model = TestCriticModel(get_critic_model(), 1)
+        target_actor = TargetActorModel()
+        actor_model = ActorModel()
+        target_critic = CriticModel()
+        critic_model = CriticModel()
 
         # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
@@ -798,7 +854,10 @@ class TestDDPG(TestCase):
             target_actor=target_actor,
             critic_model=critic_model,
             actor_model=actor_model,
-            critic_model_input_concat=lambda state_batch, action_batch: [state_batch, action_batch]
+            # state_batch и action_batch могут быть Sequence[Tensor]
+            critic_model_input_concat=lambda state_batch, action_batch: list(itertools.chain.from_iterable([
+                state_batch if isinstance(state_batch, Sequence) else [state_batch],
+                action_batch if isinstance(action_batch, Sequence) else [action_batch]]))
         )
 
         exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
