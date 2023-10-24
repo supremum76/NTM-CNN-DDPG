@@ -686,7 +686,7 @@ class TestDDPG(TestCase):
             :return: None
         """
 
-        base_block = [0] * 5 + [1] * 5
+        base_block = [0] * 1 + [1] * 1
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
@@ -699,8 +699,7 @@ class TestDDPG(TestCase):
             2  # прогноз последовательности (0 или 1)
         )
 
-        # TODO не выделять TargetActorModel и ActorModel. TargetActorModel => ActorModel
-        class TargetActorModel(DDPGActorModel):
+        class ActorModel(DDPGActorModel):
             def __init__(self):
                 inputs = layers.Input(
                     shape=(
@@ -771,39 +770,6 @@ class TestDDPG(TestCase):
             def trainable_variables(self) -> Tensor:
                 return self.__model.trainable_variables
 
-        class ActorModel(DDPGActorModel):
-            def __init__(self):
-                inputs = layers.Input(
-                    shape=(
-                        None,  # time
-                        1  # за раз обрабатываем один бит из истории последовательности
-                    )
-                )
-
-                lstm_out = (
-                    tf.keras.layers.LSTM(units=lstm_units,
-                                         dropout=lstm_dropout,
-                                         recurrent_dropout=lstm_dropout,
-                                         return_state=False)(inputs))
-
-                outputs = layers.Dense(actor_output_length, activation="elu")(lstm_out)
-
-                model = tf.keras.Model(inputs=inputs, outputs=outputs)
-
-                self.__model = model
-                self.output_length = actor_output_length
-
-            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
-                    Tensor | Sequence[Tensor]:
-
-                result = (self.__model(inputs=model_input, training=training))
-
-                return result
-
-            @property
-            def trainable_variables(self) -> Tensor:
-                return self.__model.trainable_variables
-
         class CriticModel(DDPGCriticModel):
             def __init__(self):
                 sequence_history = layers.Input(
@@ -830,7 +796,6 @@ class TestDDPG(TestCase):
 
             def predict(self, model_input: Tensor | Sequence[Tensor], training: bool,
                         batch_mode: bool = True) -> Tensor:
-                # TODO action shape=(1, 1, 2) ???
                 return self.__model(inputs=model_input, training=training)
 
             @property
@@ -840,7 +805,7 @@ class TestDDPG(TestCase):
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
-        target_actor = TargetActorModel()
+        target_actor = ActorModel()
         actor_model = ActorModel()
         target_critic = CriticModel()
         critic_model = CriticModel()
@@ -882,6 +847,8 @@ class TestDDPG(TestCase):
         sequence_history_window.append(bit)
 
         while True:
+            # TODO попробовать передавать всю хранимую историю бинарной последовательности, той-же продолжительности,
+            #   с которой выполняется обучение моделей
             original_action: Tensor = ddpg.policy(state=tf.constant(bit, dtype=tf.float32, shape=(1, 1)))
 
             #  разделяем действие
