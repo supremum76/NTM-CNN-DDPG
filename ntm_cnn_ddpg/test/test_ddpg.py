@@ -686,20 +686,67 @@ class TestDDPG(TestCase):
             :return: None
         """
 
-        base_block = [0] * 1 + [1] * 1
+        base_block = [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
         # Проверяем, что LSTM способна прогнозировать такие последовательности.
         sequence_history_window: collections.deque = collections.deque([], base_block_length * 10)
-        lstm_units: int = base_block_length
-        lstm_dropout: float = 0.0
+        sequence_history_window_extended: collections.deque = collections.deque([], base_block_length * 10)
+        lstm_units: int = int(base_block_length * 1.0)  # base_block_length * 2; 0.5 - нет обучения
+        lstm_dropout: float = 0.0  # Значения отличные от 0.0 приводят к значительному увеличению потребляемой памяти
+        batch_size: int = 10 * base_block_length
+        actor_optimizing_start_step = 1000 * base_block_length
+        buffer_capacity = 500 * base_block_length
 
         actor_output_length: int = (
             2  # прогноз последовательности (0 или 1)
         )
 
         class ActorModel(DDPGActorModel):
+            def __init__(self):
+                inputs = layers.Input(
+                    shape=(
+                        None,  # time
+                        1  # за раз обрабатываем один бит из истории последовательности
+                    )
+                )
+
+                lstm_out = (
+                    tf.keras.layers.LSTM(units=lstm_units,
+                                         # activation="LeakyReLU",
+                                         # recurrent_activation="sigmoid",
+                                         dropout=lstm_dropout,
+                                         recurrent_dropout=lstm_dropout)(inputs))
+
+                out = layers.Dense(lstm_units, activation="elu")(lstm_out)
+                out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
+                model = tf.keras.Model(inputs=inputs, outputs=out)
+
+                self.__model = model
+                self.output_length = actor_output_length
+
+            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
+                    Tensor | Sequence[Tensor]:
+                result = (
+                    self.__model(inputs=model_input if batch_mode else
+                    # добавляем фиктивное измерение пакета
+                    tf.reshape(tensor=model_input, shape=(1, *model_input.shape))
+                    if not isinstance(model_input, Sequence)
+                    else [tf.reshape(tensor=t, shape=(1, *t.shape)) for t in model_input],
+                                 training=training))
+
+                if not batch_mode:
+                    # удаляем фиктивное измерение пакета
+                    result = tf.reshape(tensor=result, shape=self.output_length)
+
+                return result
+
+            @property
+            def trainable_variables(self) -> Tensor:
+                return self.__model.trainable_variables
+
+        class ActorModel2(DDPGActorModel):
             def __init__(self):
                 inputs = layers.Input(
                     shape=(
@@ -718,10 +765,11 @@ class TestDDPG(TestCase):
                                          return_state=True)
                     (inputs, initial_state=[lstm_initial_memory_state, lstm_initial_carry_state]))
 
-                outputs = layers.Dense(actor_output_length, activation="elu")(lstm_out)
+                out = layers.Dense(lstm_units, activation="elu")(lstm_out)
+                out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
 
                 model = tf.keras.Model(inputs=[inputs, lstm_initial_memory_state, lstm_initial_carry_state],
-                                       outputs=[outputs, lstm_final_memory_state, lstm_final_carry_state])
+                                       outputs=[out, lstm_final_memory_state, lstm_final_carry_state])
 
                 self.__model = model
                 self.output_length = actor_output_length
@@ -783,11 +831,16 @@ class TestDDPG(TestCase):
                     shape=actor_output_length  # текущее действие актора
                 )
 
-                out = tf.keras.layers.LSTM(units=lstm_units, dropout=lstm_dropout, recurrent_dropout=lstm_dropout)(
+                out = tf.keras.layers.LSTM(
+                    units=lstm_units,
+                    # activation="LeakyReLU",
+                    # recurrent_activation="sigmoid",
+                    dropout=lstm_dropout,
+                    recurrent_dropout=lstm_dropout)(
                     sequence_history)
                 out = tf.keras.layers.Concatenate()([out, action])
                 out = layers.Dense(lstm_units, activation="elu")(out)
-                outputs = layers.Dense(1, activation="elu")(out)
+                outputs = layers.Dense(1, activation=None)(out)
 
                 model = tf.keras.Model([sequence_history, action], outputs)
 
@@ -803,7 +856,7 @@ class TestDDPG(TestCase):
                 return self.__model.trainable_variables
 
         # содаем буфер обучающих примеров
-        buffer: Buffer = Buffer(buffer_capacity=50000)
+        buffer: Buffer = Buffer(buffer_capacity=buffer_capacity)
 
         target_actor = ActorModel()
         actor_model = ActorModel()
@@ -811,8 +864,12 @@ class TestDDPG(TestCase):
         critic_model = CriticModel()
 
         # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
-        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3,  # 3
+                                                               weight_decay=0.1,
+                                                               global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 5
+                                                              weight_decay=0.1,  # 0.1
+                                                              global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
 
         ddpg: DDPG = DDPG(
             target_critic=target_critic,
@@ -826,7 +883,7 @@ class TestDDPG(TestCase):
         )
 
         exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
-                                                         std_deviation=tf.constant([1.0] * actor_output_length))
+                                                         std_deviation=tf.constant([0.2] * actor_output_length))
 
         # Генератор бинарной последовательности
         def binary_sequence_generator(sequence_length: int) -> Iterator[int]:
@@ -835,8 +892,8 @@ class TestDDPG(TestCase):
 
         accuracy: float = 0
         history_accuracy: list[float] = []
+        history_avg_reward: list[float] = []
         avg_reward: float = 0
-        noise_level: float = 0.2
 
         binary_sequence: Iterator[int] = iter(binary_sequence_generator(100000))
         # наполняем sequence_history_window
@@ -845,24 +902,22 @@ class TestDDPG(TestCase):
         step: int = 0
         bit: int = next(binary_sequence)
         sequence_history_window.append(bit)
+        sequence_history_window_extended.append(bit)
 
         while True:
-            # TODO попробовать передавать всю хранимую историю бинарной последовательности, той-же продолжительности,
-            #   с которой выполняется обучение моделей
-            original_action: Tensor = ddpg.policy(state=tf.constant(bit, dtype=tf.float32, shape=(1, 1)))
+            original_action: Tensor = ddpg.policy(state=
+                                                  tf.constant(value=sequence_history_window_extended, dtype=tf.float32,
+                                                              shape=(len(sequence_history_window_extended), 1))
+                                                  )
 
-            #  разделяем действие
-            #  добавляем шум исследования после разделения действия
-            index_from, index_to = 0, 2
-            forecast = original_action[index_from:index_to]
-            k = tf.reduce_mean(tf.abs(forecast))
+            #  добавляем шум исследования
+            forecast = original_action
             noise: Tensor = exploration_noise()
-            noise_forecast = forecast + noise[index_from:index_to] * (k * noise_level if k > 0 else 1)
-
             forecast = tf.reshape(
-                tensor=tf.keras.activations.softmax(tf.reshape(tensor=noise_forecast, shape=(1, 2))),
+                tensor=tf.keras.activations.softmax(tf.reshape(tensor=(forecast + noise), shape=(1, 2))),
                 shape=2
             )
+
             next_bit_prediction: int = tf.argmax(forecast).numpy()
             next_zero_prediction_prob = forecast[0].numpy()
 
@@ -870,29 +925,36 @@ class TestDDPG(TestCase):
             try:
                 bit = next(binary_sequence)
                 sequence_history_window.append(bit)
+                sequence_history_window_extended.append(bit)
             except StopIteration:
                 break
 
             reward: float = \
                 next_zero_prediction_prob - 0.5 if bit == 0 else (1 - next_zero_prediction_prob) - 0.5
+
+            # reward: float = \
+            #    1.0 if bit == next_bit_prediction \
+            #    else 2 * (next_zero_prediction_prob - 0.5 if bit == 0 else 0.5 - next_zero_prediction_prob)
+
             avg_reward += reward
 
             # представляем состояние (историю бинарной последовательности) как временную последовательность
             buffer.record(
                 state=tf.constant(value=prev_state, dtype=tf.float32, shape=(len(prev_state), 1)),
-                action=noise_forecast,
+                action=forecast,
                 reward=reward,
                 next_state=tf.constant(value=sequence_history_window, dtype=tf.float32,
                                        shape=(len(sequence_history_window), 1)),
             )
 
             ddpg.learn(buffer=buffer,
-                       batch_size=200,
-                       epochs=5,
-                       q_learning_discount_factor=0.9,
-                       target_model_update_rate=0.1,
+                       batch_size=batch_size,
+                       epochs=1,
+                       q_learning_discount_factor=0.9,  # q_learning_discount_factor=0.9
+                       target_model_update_rate=0.001,
                        critic_optimizer=critic_optimizer,
-                       actor_optimizer=actor_optimizer
+                       # TODO
+                       actor_optimizer=actor_optimizer if step > actor_optimizing_start_step else None
                        )
 
             step += 1
@@ -902,17 +964,28 @@ class TestDDPG(TestCase):
                 accuracy += 1
 
             if step % 100 == 0:
-                history_accuracy.append(accuracy / 100)
-                accuracy = 0
-
                 avg_reward /= 100
-                print(avg_reward)
+                history_avg_reward.append(avg_reward)
                 avg_reward = 0
 
-                print(sum(history_accuracy) / len(history_accuracy))
-                print(sum(history_accuracy[len(history_accuracy) - 30:]) / len(
-                    history_accuracy[len(history_accuracy) - 30:]))
-                print(history_accuracy[len(history_accuracy) - 10:])
+                history_accuracy.append(accuracy / 100)
+                accuracy = 0
+                # останавливаемся, если достигли предела качества управления
+                if step > actor_optimizing_start_step:
+                    if not (sum(history_avg_reward[len(history_avg_reward) - 5:]) >
+                            sum(history_avg_reward[len(history_avg_reward) - 10:len(history_avg_reward) - 5])):
+                        print(f"stop! "
+                              f"last avg reward {history_avg_reward[-1]} "
+                              f"last avg reward 5 {sum(history_avg_reward[len(history_avg_reward) - 5:]) / 5} "
+                              f"last accuracy {history_accuracy[-1]} "
+                              f"total steps {step}")
+                        return
+
+                if step > actor_optimizing_start_step:
+                    print(sum(history_avg_reward[len(history_avg_reward) - 5:]) / 5)
+                    print(sum(history_accuracy[len(history_avg_reward) - 5:]) / 5)
+                    print(history_avg_reward[len(history_avg_reward) - 5:])
+                    print(history_accuracy[len(history_accuracy) - 5:])
                 print(len(history_accuracy))
 
     def _test_binary_sequence_prediction_mlp_ntm(self) -> None:
