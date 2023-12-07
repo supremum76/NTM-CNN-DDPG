@@ -192,7 +192,8 @@ class DDPG:
               q_learning_discount_factor: float,
               target_model_update_rate: float,
               critic_optimizer: tf.optimizers.Optimizer,
-              actor_optimizer: tf.optimizers.Optimizer | None):
+              actor_optimizer: tf.optimizers.Optimizer | None,
+              optimal_action: Callable[[CriticModel, OptionalSeqTensors], OptionalSeqTensors]):
 
         # if not enough records for batch
         if buffer.records_count() < batch_size:
@@ -206,7 +207,7 @@ class DDPG:
         if actor_optimizer:
             for _ in range(epochs):
                 self._update_actor_model(state_batch=buffer.new_batch_records(batch_size, only_state_batch=True),
-                                         actor_optimizer=actor_optimizer)
+                                         actor_optimizer=actor_optimizer, optimal_action=optimal_action)
 
         tensor_update_rate: Tensor = tf.constant(target_model_update_rate)
         if actor_optimizer:
@@ -249,7 +250,21 @@ class DDPG:
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer):
+    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer,
+                            optimal_action: Callable[[CriticModel, OptionalSeqTensors], OptionalSeqTensors]):
+
+        """
+        target_actions = _tensors_to_seq_tensors(optimal_action(self.critic_model, state_batch))
+        with tf.GradientTape(watch_accessed_variables=False) as tape:
+            for t in self.actor_model.trainable_variables:
+                tape.watch(t)
+            actor_actions = _tensors_to_seq_tensors(self.actor_model.predict(state_batch, training=True))
+            actor_loss = tf.math.reduce_mean(
+                tf.math.square(tf.stack(target_actions, axis=0) - tf.stack(actor_actions, axis=0)))
+
+        actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)
+        """
+
         # Training and updating Actor network.
         with tf.GradientTape(watch_accessed_variables=False) as tape:
             for t in self.actor_model.trainable_variables:
@@ -262,7 +277,17 @@ class DDPG:
             # by the critic for our actions
             actor_loss = -tf.math.reduce_mean(critic_value)
 
-        # TODO актор застревает в локальном оптимуме (точка w уходит в экстремальную позицию из которой впоследствии градиентный поиск на уже хорошо обученном критике не спрособен ее вывести), вохникающем из-за небольших ошибок моделирования критика.
-        #    Или из-за поощрения актора генерировать предельные значения управления ?
-        #    Актор начинает генерировать константное действие.
+        # TODO актор застревает в ложном оптимуме. Ложная точка оптимума не исправляется, так как она находится
+        #  за пределами допустимого управления. Направление градиента постоянно "толкает" актора к этой ложной точке оптимума,
+        #  что приводит к генерации актором константного и экстремального управления.
+        #  График функции критика на пакете (!!!) примеров можно представить как обратная парабола с перекосом в одну из сторон.
+        #  Мы оптимизируем управление по этой гиперболе для максимизации функции критика.
+        #
+        #  TODO Если изменить обучение актора, на попримерное online обучение, то возможно это позволит устранить проблему.
+        #   Либо для каждого примера отдельно подбирать по критику оптимальное управление, формировать из примеров пакет
+        #   и уже на этом пакете обучать критика вычислять оптимальное управление.
+        #  
+        #  TODO что если в качестве функции активации использовать tf.math.sin ??? 
+        #   Такая функция ограничена, но не имеет областей насыщения (производная sin* = cos)tf.math.sin ??? Функция ограничена, но не имеет областей насыщения (производная sin* = cos)
+        #   Останется правда softmax в выходном слое. Хотя если  softmax предварить tf.math.sin, то связка tf.math.sin + softmax уже не будет иметь обширных областей насыщения.
         actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)

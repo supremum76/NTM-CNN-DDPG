@@ -12,7 +12,8 @@ import tensorflow as tf
 from keras import layers
 from keras.optimizers import Optimizer
 
-from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel as DDPGActorModel, CriticModel as DDPGCriticModel
+from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel as DDPGActorModel, CriticModel as DDPGCriticModel, \
+    OptionalSeqTensors
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
 from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
 from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
@@ -695,13 +696,31 @@ class TestDDPG(TestCase):
         sequence_history_window_extended: collections.deque = collections.deque([], base_block_length * 10)
         lstm_units: int = int(base_block_length * 1.0)  # base_block_length * 2; 0.5 - нет обучения
         lstm_dropout: float = 0.0  # Значения отличные от 0.0 приводят к значительному увеличению потребляемой памяти
-        batch_size: int = 10 * base_block_length
+        batch_size: int = 20 * base_block_length
         actor_optimizing_start_step = 1000 * base_block_length
         buffer_capacity = 500 * base_block_length
 
         actor_output_length: int = (
             2  # прогноз последовательности (0 или 1)
         )
+
+        @tf.function
+        def activation1(x: Tensor):
+            """
+            x -> [-1, +1]
+            :param x:
+            :return: x -> [-1, +1]
+            """
+            return tf.math.sin(x)
+
+        @tf.function
+        def activation2(x: Tensor):
+            """
+            x -> [0, 1]
+            :param x:
+            :return: x -> [0, 1]
+            """
+            return tf.math.sin(x)**2
 
         class ActorModel(DDPGActorModel):
             def __init__(self):
@@ -714,13 +733,15 @@ class TestDDPG(TestCase):
 
                 lstm_out = (
                     tf.keras.layers.LSTM(units=lstm_units,
-                                         # activation="LeakyReLU",
-                                         # recurrent_activation="sigmoid",
+                                         activation=activation1,
+                                         recurrent_activation=activation2,
                                          dropout=lstm_dropout,
                                          recurrent_dropout=lstm_dropout)(inputs))
 
                 out = layers.Dense(lstm_units, activation="elu")(lstm_out)
-                out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
+                # out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
+                out = layers.Dense(actor_output_length, activation=activation1)(out)
+                out = tf.keras.activations.softmax(out)
                 model = tf.keras.Model(inputs=inputs, outputs=out)
 
                 self.__model = model
@@ -760,13 +781,17 @@ class TestDDPG(TestCase):
 
                 lstm_out, lstm_final_memory_state, lstm_final_carry_state = (
                     tf.keras.layers.LSTM(units=lstm_units,
+                                         activation=activation1,
+                                         recurrent_activation=activation2,
                                          dropout=lstm_dropout,
                                          recurrent_dropout=lstm_dropout,
                                          return_state=True)
                     (inputs, initial_state=[lstm_initial_memory_state, lstm_initial_carry_state]))
 
                 out = layers.Dense(lstm_units, activation="elu")(lstm_out)
-                out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
+                # out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
+                out = layers.Dense(actor_output_length, activation=activation1)(out)
+                out = tf.keras.activations.softmax(out)
 
                 model = tf.keras.Model(inputs=[inputs, lstm_initial_memory_state, lstm_initial_carry_state],
                                        outputs=[out, lstm_final_memory_state, lstm_final_carry_state])
@@ -833,8 +858,8 @@ class TestDDPG(TestCase):
 
                 out = tf.keras.layers.LSTM(
                     units=lstm_units,
-                    # activation="LeakyReLU",
-                    # recurrent_activation="sigmoid",
+                    activation=activation1,
+                    recurrent_activation=activation2,
                     dropout=lstm_dropout,
                     recurrent_dropout=lstm_dropout)(
                     sequence_history)
@@ -855,6 +880,32 @@ class TestDDPG(TestCase):
             def trainable_variables(self) -> Tensor:
                 return self.__model.trainable_variables
 
+        def critic_model_input_concat(state_batch: OptionalSeqTensors, action_batch: OptionalSeqTensors) \
+                -> OptionalSeqTensors:
+            return list(itertools.chain.from_iterable([
+                state_batch if isinstance(state_batch, Sequence) else [state_batch],
+                action_batch if isinstance(action_batch, Sequence) else [action_batch]]))
+
+        def optimal_action(critic_model: CriticModel, state_batch: OptionalSeqTensors) -> OptionalSeqTensors:
+            action10 = tf.constant([[1.0, 0.0]])
+            action01 = tf.constant([[0.0, 1.0]])
+
+            def choice_action(state: OptionalSeqTensors) -> Tensor:
+                reward10 = tf.reshape(critic_model.predict(critic_model_input_concat(
+                    tf.reshape(tensor=state[0], shape=(1, *state[0].shape)), action10), training=False),
+                    shape=())
+                reward01 = tf.reshape(critic_model.predict(critic_model_input_concat(
+                    tf.reshape(tensor=state[0], shape=(1, *state[0].shape)), action01), training=False),
+                    shape=())
+                comp = tf.cast(reward10 > reward01, dtype=tf.float32)
+                return tf.math.reduce_sum(tf.stack([comp, 1 - comp], axis=0) *
+                                          tf.stack([tf.reshape(action10, shape=[2]),
+                                                    tf.reshape(action01, shape=[2])],
+                                                   axis=0),
+                                          axis=0)
+
+            return tf.vectorized_map(fn=choice_action, elems=state_batch)
+
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=buffer_capacity)
 
@@ -867,7 +918,7 @@ class TestDDPG(TestCase):
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3,  # 3
                                                                weight_decay=0.1,
                                                                global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 5
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 4
                                                               weight_decay=0.1,  # 0.1
                                                               global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
 
@@ -876,10 +927,7 @@ class TestDDPG(TestCase):
             target_actor=target_actor,
             critic_model=critic_model,
             actor_model=actor_model,
-            # state_batch и action_batch могут быть Sequence[Tensor]
-            critic_model_input_concat=lambda state_batch, action_batch: list(itertools.chain.from_iterable([
-                state_batch if isinstance(state_batch, Sequence) else [state_batch],
-                action_batch if isinstance(action_batch, Sequence) else [action_batch]]))
+            critic_model_input_concat=critic_model_input_concat
         )
 
         exploration_noise: OUActionNoise = OUActionNoise(mean=tf.constant([0.0] * actor_output_length),
@@ -953,8 +1001,9 @@ class TestDDPG(TestCase):
                        q_learning_discount_factor=0.9,  # q_learning_discount_factor=0.9
                        target_model_update_rate=0.001,
                        critic_optimizer=critic_optimizer,
-                       # TODO
-                       actor_optimizer=actor_optimizer if step > actor_optimizing_start_step else None
+                       # TODO ???
+                       actor_optimizer=actor_optimizer if step > actor_optimizing_start_step else None,
+                       optimal_action=optimal_action
                        )
 
             step += 1
@@ -971,21 +1020,21 @@ class TestDDPG(TestCase):
                 history_accuracy.append(accuracy / 100)
                 accuracy = 0
                 # останавливаемся, если достигли предела качества управления
-                if step > actor_optimizing_start_step:
-                    if not (sum(history_avg_reward[len(history_avg_reward) - 5:]) >
-                            sum(history_avg_reward[len(history_avg_reward) - 10:len(history_avg_reward) - 5])):
+                if step > actor_optimizing_start_step + 10:
+                    if not (sum(history_avg_reward[len(history_avg_reward) - 10:]) >
+                            sum(history_avg_reward[len(history_avg_reward) - 20:len(history_avg_reward) - 10])):
                         print(f"stop! "
                               f"last avg reward {history_avg_reward[-1]} "
-                              f"last avg reward 5 {sum(history_avg_reward[len(history_avg_reward) - 5:]) / 5} "
+                              f"last avg reward 10 {sum(history_avg_reward[len(history_avg_reward) - 10:]) / 10} "
                               f"last accuracy {history_accuracy[-1]} "
                               f"total steps {step}")
                         return
 
                 if step > actor_optimizing_start_step:
-                    print(sum(history_avg_reward[len(history_avg_reward) - 5:]) / 5)
-                    print(sum(history_accuracy[len(history_avg_reward) - 5:]) / 5)
-                    print(history_avg_reward[len(history_avg_reward) - 5:])
-                    print(history_accuracy[len(history_accuracy) - 5:])
+                    print(sum(history_avg_reward[len(history_avg_reward) - 10:]) / 10)
+                    print(sum(history_accuracy[len(history_avg_reward) - 10:]) / 10)
+                    print(history_avg_reward[len(history_avg_reward) - 10:])
+                    print(history_accuracy[len(history_accuracy) - 10:])
                 print(len(history_accuracy))
 
     def _test_binary_sequence_prediction_mlp_ntm(self) -> None:

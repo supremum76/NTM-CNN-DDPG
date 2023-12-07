@@ -7,7 +7,7 @@ Tensor = tf.Tensor
 OptionalSeqTensors = Tensor | Sequence[Tensor]
 SeqTensors = Sequence[Tensor]
 
-
+# TODO __call__ -> predict
 class Model(ABC):
     @abstractmethod
     def predict(self, model_input: OptionalSeqTensors, training: bool, batch_mode: bool = True) -> \
