@@ -1,11 +1,11 @@
 import collections
+import gc
 import itertools
-import math
 import random
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
-from typing import Iterator, Sequence
+from typing import Iterator, Sequence, Any
 from unittest import TestCase
 
 import tensorflow as tf
@@ -687,7 +687,7 @@ class TestDDPG(TestCase):
             :return: None
         """
 
-        base_block = [0] * 5 + [1] * 5
+        base_block = [0] * 2 + [1] * 2  # [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
@@ -697,7 +697,7 @@ class TestDDPG(TestCase):
         lstm_units: int = int(base_block_length * 1.0)  # base_block_length * 2; 0.5 - нет обучения
         lstm_dropout: float = 0.0  # Значения отличные от 0.0 приводят к значительному увеличению потребляемой памяти
         batch_size: int = 20 * base_block_length
-        actor_optimizing_start_step = 1000 * base_block_length
+        actor_optimizing_start_step = 5 * batch_size
         buffer_capacity = 500 * base_block_length
 
         actor_output_length: int = (
@@ -720,7 +720,7 @@ class TestDDPG(TestCase):
             :param x:
             :return: x -> [0, 1]
             """
-            return tf.math.sin(x)**2
+            return tf.math.sin(x) ** 2
 
         class ActorModel(DDPGActorModel):
             def __init__(self):
@@ -766,6 +766,14 @@ class TestDDPG(TestCase):
             @property
             def trainable_variables(self) -> Tensor:
                 return self.__model.trainable_variables
+
+            def get_weights(self) -> Any:
+                return [layer.get_weights() for layer in self.__model.layers if layer.count_params() > 0]
+
+            def set_weights(self, weights: Any) -> None:
+                for layer, weights in (
+                        zip([layer for layer in self.__model.layers if layer.count_params() > 0], weights)):
+                    layer.set_weights(weights)
 
         class ActorModel2(DDPGActorModel):
             def __init__(self):
@@ -880,6 +888,14 @@ class TestDDPG(TestCase):
             def trainable_variables(self) -> Tensor:
                 return self.__model.trainable_variables
 
+            def get_weights(self) -> Any:
+                return [layer.get_weights() for layer in self.__model.layers if layer.count_params() > 0]
+
+            def set_weights(self, weights: Any) -> None:
+                for layer, weights in (
+                        zip([layer for layer in self.__model.layers if layer.count_params() > 0], weights)):
+                    layer.set_weights(weights)
+
         def critic_model_input_concat(state_batch: OptionalSeqTensors, action_batch: OptionalSeqTensors) \
                 -> OptionalSeqTensors:
             return list(itertools.chain.from_iterable([
@@ -915,12 +931,12 @@ class TestDDPG(TestCase):
         critic_model = CriticModel()
 
         # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
-        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3,  # 3
+        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 3
                                                                weight_decay=0.1,
-                                                               global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 4
+                                                               global_clipnorm=1.0)  # global_clipnorm lr=0.01 weight_decay=0.1
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-5,  # 4
                                                               weight_decay=0.1,  # 0.1
-                                                              global_clipnorm=1.0)  # lr=0.01 weight_decay=0.1
+                                                              global_clipnorm=1.0)  # global_clipnorm lr=0.01 weight_decay=0.1
 
         ddpg: DDPG = DDPG(
             target_critic=target_critic,
@@ -1019,23 +1035,27 @@ class TestDDPG(TestCase):
 
                 history_accuracy.append(accuracy / 100)
                 accuracy = 0
+                stat_window_len: int = 20
                 # останавливаемся, если достигли предела качества управления
-                if step > actor_optimizing_start_step + 10:
-                    if not (sum(history_avg_reward[len(history_avg_reward) - 10:]) >
-                            sum(history_avg_reward[len(history_avg_reward) - 20:len(history_avg_reward) - 10])):
+                if step > actor_optimizing_start_step + stat_window_len * 100 and step > 2 * stat_window_len * 100:
+                    if not (sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) >
+                            sum(history_avg_reward[len(history_avg_reward) -
+                                                   2 * stat_window_len:len(history_avg_reward) - stat_window_len])):
                         print(f"stop! "
                               f"last avg reward {history_avg_reward[-1]} "
-                              f"last avg reward 10 {sum(history_avg_reward[len(history_avg_reward) - 10:]) / 10} "
+                              f"last avg reward {stat_window_len} {sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) / stat_window_len} "
                               f"last accuracy {history_accuracy[-1]} "
                               f"total steps {step}")
                         return
 
-                if step > actor_optimizing_start_step:
-                    print(sum(history_avg_reward[len(history_avg_reward) - 10:]) / 10)
-                    print(sum(history_accuracy[len(history_avg_reward) - 10:]) / 10)
-                    print(history_avg_reward[len(history_avg_reward) - 10:])
-                    print(history_accuracy[len(history_accuracy) - 10:])
+                if step > actor_optimizing_start_step and step > stat_window_len:
+                    print(sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) / stat_window_len)
+                    print(sum(history_accuracy[len(history_avg_reward) - stat_window_len:]) / stat_window_len)
+                    print(history_avg_reward[len(history_avg_reward) - stat_window_len:])
+                    print(history_accuracy[len(history_accuracy) - stat_window_len:])
                 print(len(history_accuracy))
+
+                gc.collect()
 
     def _test_binary_sequence_prediction_mlp_ntm(self) -> None:
         """

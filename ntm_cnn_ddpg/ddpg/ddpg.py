@@ -7,10 +7,12 @@ https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
 import collections.abc
-from typing import Callable, Sequence
+from typing import Callable
+from copy import deepcopy
 
 import numpy as np
 import tensorflow as tf
+from scipy.optimize import minimize_scalar
 
 from ntm_cnn_ddpg.cnn.model import Tensor, OptionalSeqTensors, SeqTensors, CriticModel, ActorModel
 
@@ -232,6 +234,7 @@ class DDPG:
             critic_optimizer: tf.optimizers.Optimizer,
             q_learning_discount_factor: Tensor
     ):
+
         # Training and updating Critic network.
         with tf.GradientTape(watch_accessed_variables=False) as tape:
             for t in self.critic_model.trainable_variables:
@@ -245,7 +248,38 @@ class DDPG:
                                                      training=True)
             critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
 
-        critic_optimizer.minimize(loss=critic_loss, var_list=self.critic_model.trainable_variables, tape=tape)
+        grads_and_vars = critic_optimizer.compute_gradients(loss=critic_loss,
+                                                            var_list=self.critic_model.trainable_variables,
+                                                            tape=tape)
+
+        def optimal_learning_rate() -> float:
+            def fun(x: float) -> float:
+                # _distribution_strategy не может клонироваться
+                strategy = critic_optimizer._distribution_strategy
+                critic_optimizer._distribution_strategy = None  # TODO сделать проверку наличия атрибута _distribution_strategy
+                optimizer = deepcopy(critic_optimizer)  # critic_optimizer.from_config(critic_optimizer.get_config())
+                optimizer._distribution_strategy = strategy
+                critic_optimizer._distribution_strategy = strategy
+
+                # сохраняем текущие параметры модели
+                model_weights = self.critic_model.get_weights()
+                optimizer.learning_rate = x
+                optimizer.apply_gradients(grads_and_vars)
+                critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
+                                                         training=False)
+                critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
+                # восстанавливаем параметры модели
+                self.critic_model.set_weights(model_weights)
+                return critic_loss.numpy()
+
+            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
+            # r = minimize_scalar(fun=fun, bracket=[1E-4, 1E-2], method="brent", tol=1E-3, options={"maxiter": 30})
+
+            return r.x
+
+        critic_optimizer.learning_rate = optimal_learning_rate()
+        critic_optimizer.apply_gradients(grads_and_vars)
+        # critic_optimizer.minimize(loss=critic_loss, var_list=self.critic_model.trainable_variables, tape=tape)
 
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
@@ -277,17 +311,38 @@ class DDPG:
             # by the critic for our actions
             actor_loss = -tf.math.reduce_mean(critic_value)
 
-        # TODO актор застревает в ложном оптимуме. Ложная точка оптимума не исправляется, так как она находится
-        #  за пределами допустимого управления. Направление градиента постоянно "толкает" актора к этой ложной точке оптимума,
-        #  что приводит к генерации актором константного и экстремального управления.
-        #  График функции критика на пакете (!!!) примеров можно представить как обратная парабола с перекосом в одну из сторон.
-        #  Мы оптимизируем управление по этой гиперболе для максимизации функции критика.
-        #
-        #  TODO Если изменить обучение актора, на попримерное online обучение, то возможно это позволит устранить проблему.
-        #   Либо для каждого примера отдельно подбирать по критику оптимальное управление, формировать из примеров пакет
-        #   и уже на этом пакете обучать критика вычислять оптимальное управление.
-        #  
-        #  TODO что если в качестве функции активации использовать tf.math.sin ??? 
-        #   Такая функция ограничена, но не имеет областей насыщения (производная sin* = cos)tf.math.sin ??? Функция ограничена, но не имеет областей насыщения (производная sin* = cos)
-        #   Останется правда softmax в выходном слое. Хотя если  softmax предварить tf.math.sin, то связка tf.math.sin + softmax уже не будет иметь обширных областей насыщения.
-        actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)
+        grads_and_vars = actor_optimizer.compute_gradients(loss=actor_loss,
+                                                           var_list=self.actor_model.trainable_variables,
+                                                           tape=tape)
+
+        def optimal_learning_rate() -> float:
+            def fun(x: float) -> float:
+                # _distribution_strategy не может клонироваться
+                strategy = actor_optimizer._distribution_strategy
+                actor_optimizer._distribution_strategy = None
+                optimizer = deepcopy(actor_optimizer)  # actor_optimizer.from_config(actor_optimizer.get_config())
+                optimizer._distribution_strategy = strategy
+                actor_optimizer._distribution_strategy = strategy
+
+                # сохраняем текущие параметры модели
+                model_weights = self.actor_model.get_weights()
+                optimizer.learning_rate = x
+                optimizer.apply_gradients(grads_and_vars)
+                actions = self.actor_model.predict(state_batch, training=False)
+                critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, actions),
+                                                         training=False)
+                # Used `-value` as we want to maximize the value given
+                # by the critic for our actions
+                actor_loss = -tf.math.reduce_mean(critic_value)
+                # восстанавливаем параметры модели
+                self.actor_model.set_weights(model_weights)
+                return actor_loss.numpy()
+
+            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
+            # r = minimize_scalar(fun=fun, bracket=[1E-4, 1E-2], method="brent", tol=1E-3, options={"maxiter": 30})
+
+            return r.x
+
+        actor_optimizer.learning_rate = optimal_learning_rate()
+        actor_optimizer.apply_gradients(grads_and_vars)
+        # actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)

@@ -9,6 +9,7 @@ packages = [{include = "ntm_cnn_ddpg"}]
 [tool.poetry.dependencies]
 python = "3.11"
 tensorflow = "2.12.0"
+scipy = "1.11.3"
 
 [build-system]
 requires = ["poetry-core"]

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Sequence, Any
 
 import tensorflow as tf
 
@@ -31,6 +31,23 @@ class Model(ABC):
         """
         Возвразает тензор параметров модели, подлежащий коррекции в процессе обучения.
         :return: Обучаемые параметры модели.
+        """
+        pass
+
+    @abstractmethod
+    def set_weights(self, weights: Any) -> None:
+        """
+        Установить веса модели.
+        :param weights: Веса модели
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    def get_weights(self) -> Any:
+        """
+        Возвратить веса модели.
+        :return: Веса модели.
         """
         pass
 
