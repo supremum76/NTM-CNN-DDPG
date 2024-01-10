@@ -1,7 +1,9 @@
+import os
 import collections
 import gc
 import itertools
 import random
+import collections.abc
 from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
@@ -15,7 +17,7 @@ from keras.optimizers import Optimizer
 from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel as DDPGActorModel, CriticModel as DDPGCriticModel, \
     OptionalSeqTensors
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
-from ntm_cnn_ddpg.ddpg.ddpg import Buffer, DDPG, OUActionNoise
+from ntm_cnn_ddpg.ddpg.twindelayedddpg import Buffer, TwinDelayedDDPG, OUActionNoise
 from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
 
 
@@ -195,7 +197,7 @@ class TestDDPG(TestCase):
             concat_input_tensors(state_batch, tf.reshape(action_batch, (*action_batch.shape, 1)))
         )
 
-        ddpg: DDPG = DDPG(
+        ddpg: TwinDelayedDDPG = TwinDelayedDDPG(
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,
@@ -378,7 +380,7 @@ class TestDDPG(TestCase):
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=50000)
 
-        ddpg: DDPG = DDPG(
+        ddpg: TwinDelayedDDPG = TwinDelayedDDPG(
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,
@@ -573,7 +575,7 @@ class TestDDPG(TestCase):
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
         actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
 
-        ddpg: DDPG = DDPG(
+        ddpg: TwinDelayedDDPG = TwinDelayedDDPG(
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,
@@ -687,7 +689,11 @@ class TestDDPG(TestCase):
             :return: None
         """
 
-        base_block = [0] * 2 + [1] * 2  # [0] * 5 + [1] * 5
+        cpu_count = os.cpu_count() // 2 or 1
+        tf.config.threading.set_inter_op_parallelism_threads(cpu_count)
+        tf.config.threading.set_intra_op_parallelism_threads(cpu_count)
+
+        base_block = [0] * 1 + [1] * 1  # [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
@@ -695,9 +701,9 @@ class TestDDPG(TestCase):
         sequence_history_window: collections.deque = collections.deque([], base_block_length * 10)
         sequence_history_window_extended: collections.deque = collections.deque([], base_block_length * 10)
         lstm_units: int = int(base_block_length * 1.0)  # base_block_length * 2; 0.5 - нет обучения
-        lstm_dropout: float = 0.0  # Значения отличные от 0.0 приводят к значительному увеличению потребляемой памяти
+        lstm_dropout: float = 0.0
         batch_size: int = 20 * base_block_length
-        actor_optimizing_start_step = 5 * batch_size
+        td3_policy_update_delay = 5 * base_block_length
         buffer_capacity = 500 * base_block_length
 
         actor_output_length: int = (
@@ -749,13 +755,21 @@ class TestDDPG(TestCase):
 
             def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
                     Tensor | Sequence[Tensor]:
+
+                @tf.function
+                def model_output(model, inputs, **kwargs):
+                    return model(inputs, **kwargs)
+
                 result = (
-                    self.__model(inputs=model_input if batch_mode else
-                    # добавляем фиктивное измерение пакета
-                    tf.reshape(tensor=model_input, shape=(1, *model_input.shape))
-                    if not isinstance(model_input, Sequence)
-                    else [tf.reshape(tensor=t, shape=(1, *t.shape)) for t in model_input],
-                                 training=training))
+                    model_output(
+                        model=self.__model,
+                        inputs=model_input if batch_mode else
+                        # добавляем фиктивное измерение пакета
+                        tf.reshape(tensor=model_input, shape=(1, *model_input.shape))
+                        if not isinstance(model_input, Sequence)
+                        else [tf.reshape(tensor=t, shape=(1, *t.shape)) for t in model_input],
+                        training=training)
+                )
 
                 if not batch_mode:
                     # удаляем фиктивное измерение пакета
@@ -774,82 +788,6 @@ class TestDDPG(TestCase):
                 for layer, weights in (
                         zip([layer for layer in self.__model.layers if layer.count_params() > 0], weights)):
                     layer.set_weights(weights)
-
-        class ActorModel2(DDPGActorModel):
-            def __init__(self):
-                inputs = layers.Input(
-                    shape=(
-                        None,  # time
-                        1  # за раз обрабатываем один бит из истории последовательности
-                    )
-                )
-
-                lstm_initial_memory_state = layers.Input((lstm_units,))
-                lstm_initial_carry_state = layers.Input((lstm_units,))
-
-                lstm_out, lstm_final_memory_state, lstm_final_carry_state = (
-                    tf.keras.layers.LSTM(units=lstm_units,
-                                         activation=activation1,
-                                         recurrent_activation=activation2,
-                                         dropout=lstm_dropout,
-                                         recurrent_dropout=lstm_dropout,
-                                         return_state=True)
-                    (inputs, initial_state=[lstm_initial_memory_state, lstm_initial_carry_state]))
-
-                out = layers.Dense(lstm_units, activation="elu")(lstm_out)
-                # out = layers.Dense(actor_output_length, activation=tf.keras.activations.softmax)(out)
-                out = layers.Dense(actor_output_length, activation=activation1)(out)
-                out = tf.keras.activations.softmax(out)
-
-                model = tf.keras.Model(inputs=[inputs, lstm_initial_memory_state, lstm_initial_carry_state],
-                                       outputs=[out, lstm_final_memory_state, lstm_final_carry_state])
-
-                self.__model = model
-                self.output_length = actor_output_length
-                self.__lstm_memory_state = tf.constant([0] * lstm_units, dtype=tf.float32, shape=(1, lstm_units))
-                self.__lstm_carry_state = tf.constant([0] * lstm_units, dtype=tf.float32, shape=(1, lstm_units))
-
-            def predict(self, model_input: Tensor | Sequence[Tensor], training: bool, batch_mode: bool = True) -> \
-                    Tensor | Sequence[Tensor]:
-
-                online_mode: bool = not batch_mode
-
-                lstm_init_memory_state: tf.Tensor = self.__lstm_memory_state
-                lstm_init_carry_state: tf.Tensor = self.__lstm_carry_state
-
-                # в пакетном режиме используем нулевое начальное состояние lstm-слоя
-                if batch_mode:
-                    batch_size: int = model_input[0].shape[0] if isinstance(model_input, Sequence) \
-                        else model_input.shape[0]
-                    lstm_batch_init_memory_state: tf.Tensor = (
-                        tf.constant([0] * lstm_units * batch_size, dtype=tf.float32,
-                                    shape=(batch_size, lstm_units)))
-
-                    lstm_init_memory_state = lstm_batch_init_memory_state
-                    lstm_init_carry_state = lstm_batch_init_memory_state
-
-                result, lstm_final_memory_state, lstm_final_carry_state = (
-                    self.__model(inputs=[model_input if batch_mode else
-                                         # добавляем фиктивное измерение пакета
-                                         tf.reshape(tensor=model_input, shape=(1, *model_input.shape))
-                                         if not isinstance(model_input, Sequence)
-                                         else [tf.reshape(tensor=t, shape=(1, *t.shape)) for t in model_input],
-                                         lstm_init_memory_state,
-                                         lstm_init_carry_state],
-                                 training=training))
-
-                if online_mode:
-                    # удаляем фиктивное измерение пакета
-                    result = tf.reshape(tensor=result, shape=self.output_length)
-                    # запоминаем новое состояние lstm-слоя только в online-режиме
-                    self.__lstm_memory_state = lstm_final_memory_state
-                    self.__lstm_carry_state = lstm_final_carry_state
-
-                return result
-
-            @property
-            def trainable_variables(self) -> Tensor:
-                return self.__model.trainable_variables
 
         class CriticModel(DDPGCriticModel):
             def __init__(self):
@@ -882,7 +820,11 @@ class TestDDPG(TestCase):
 
             def predict(self, model_input: Tensor | Sequence[Tensor], training: bool,
                         batch_mode: bool = True) -> Tensor:
-                return self.__model(inputs=model_input, training=training)
+                @tf.function
+                def model_output(model, inputs, **kwargs):
+                    return model(inputs, **kwargs)
+
+                return model_output(model=self.__model, inputs=model_input, training=training)
 
             @property
             def trainable_variables(self) -> Tensor:
@@ -922,26 +864,35 @@ class TestDDPG(TestCase):
 
             return tf.vectorized_map(fn=choice_action, elems=state_batch)
 
+        def td3_target_policy_smoothing(x: OptionalSeqTensors) -> OptionalSeqTensors:
+            stddev = 0.05
+            if isinstance(x, collections.abc.Sequence):
+                return [t + tf.random.normal(shape=t.shape, stddev=stddev) for t in x]
+            else:
+                return x + tf.random.normal(shape=x.shape, stddev=stddev)
+
+
         # содаем буфер обучающих примеров
         buffer: Buffer = Buffer(buffer_capacity=buffer_capacity)
 
         target_actor = ActorModel()
         actor_model = ActorModel()
-        target_critic = CriticModel()
-        critic_model = CriticModel()
+        td3_target_critic1 = CriticModel()
+        td3_target_critic2 = CriticModel()
+        td3_critic_model1 = CriticModel()
+        td3_critic_model2 = CriticModel()
 
         # !!! weight_decay=1.0 Предотвращаем попадание входа функции активации в область "насыщения".
-        critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-4,  # 3
-                                                               weight_decay=0.1,
-                                                               global_clipnorm=1.0)  # global_clipnorm lr=0.01 weight_decay=0.1
-        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-5,  # 4
-                                                              weight_decay=0.1,  # 0.1
-                                                              global_clipnorm=1.0)  # global_clipnorm lr=0.01 weight_decay=0.1
+        td3_critic_optimizer1: Optimizer = tf.keras.optimizers.Adam(weight_decay=0.1, global_clipnorm=1.0)
+        td3_critic_optimizer2: Optimizer = tf.keras.optimizers.Adam(weight_decay=0.1, global_clipnorm=1.0)
+        actor_optimizer: Optimizer = tf.keras.optimizers.Adam(weight_decay=0.1, global_clipnorm=1.0)
 
-        ddpg: DDPG = DDPG(
-            target_critic=target_critic,
+        ddpg: TwinDelayedDDPG = TwinDelayedDDPG(
             target_actor=target_actor,
-            critic_model=critic_model,
+            td3_target_critic1=td3_target_critic1,
+            td3_target_critic2=td3_target_critic2,
+            td3_critic_model1=td3_critic_model1,
+            td3_critic_model2=td3_critic_model2,
             actor_model=actor_model,
             critic_model_input_concat=critic_model_input_concat
         )
@@ -1014,12 +965,13 @@ class TestDDPG(TestCase):
             ddpg.learn(buffer=buffer,
                        batch_size=batch_size,
                        epochs=1,
-                       q_learning_discount_factor=0.9,  # q_learning_discount_factor=0.9
+                       q_learning_discount_factor=0.9,
                        target_model_update_rate=0.001,
-                       critic_optimizer=critic_optimizer,
-                       # TODO ???
-                       actor_optimizer=actor_optimizer if step > actor_optimizing_start_step else None,
-                       optimal_action=optimal_action
+                       td3_critic_optimizer1=td3_critic_optimizer1,
+                       td3_critic_optimizer2=td3_critic_optimizer2,
+                       actor_optimizer=actor_optimizer,
+                       td3_target_policy_smoothing=td3_target_policy_smoothing,
+                       td3_policy_update_delay=td3_policy_update_delay
                        )
 
             step += 1
@@ -1037,7 +989,7 @@ class TestDDPG(TestCase):
                 accuracy = 0
                 stat_window_len: int = 20
                 # останавливаемся, если достигли предела качества управления
-                if step > actor_optimizing_start_step + stat_window_len * 100 and step > 2 * stat_window_len * 100:
+                if step > 2 * stat_window_len * 100:
                     if not (sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) >
                             sum(history_avg_reward[len(history_avg_reward) -
                                                    2 * stat_window_len:len(history_avg_reward) - stat_window_len])):
@@ -1048,7 +1000,7 @@ class TestDDPG(TestCase):
                               f"total steps {step}")
                         return
 
-                if step > actor_optimizing_start_step and step > stat_window_len:
+                if step > stat_window_len * 100:
                     print(sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) / stat_window_len)
                     print(sum(history_accuracy[len(history_avg_reward) - stat_window_len:]) / stat_window_len)
                     print(history_avg_reward[len(history_avg_reward) - stat_window_len:])
@@ -1178,7 +1130,7 @@ class TestDDPG(TestCase):
         critic_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
         actor_optimizer: Optimizer = tf.keras.optimizers.Adam(learning_rate=1E-3, weight_decay=1.0)
 
-        ddpg: DDPG = DDPG(
+        ddpg: TwinDelayedDDPG = TwinDelayedDDPG(
             target_critic=target_critic,
             target_actor=target_actor,
             critic_model=critic_model,

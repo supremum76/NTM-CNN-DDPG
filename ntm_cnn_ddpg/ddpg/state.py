@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from ntm_cnn_ddpg.ddpg.ddpg import OptionalSeqTensors
+from ntm_cnn_ddpg.ddpg.twindelayedddpg import OptionalSeqTensors
 
 
 # TODO внедрить использование класса в классы Buffer и DDPG

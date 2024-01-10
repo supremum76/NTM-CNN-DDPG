@@ -7,7 +7,7 @@ https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
 import collections.abc
-from typing import Callable
+from typing import Callable, Optional
 from copy import deepcopy
 
 import numpy as np
@@ -153,28 +153,76 @@ class Buffer:
         return min(self.buffer_counter, self.buffer_capacity)
 
 
-class DDPG:
+class TwinDelayedDDPG:
+    """
+    Реализация Twin Delayed DDPG (другое наименование TD3)
+    """
+
     def __init__(self,
-                 target_critic: CriticModel,
+                 td3_target_critic1: CriticModel,
+                 td3_target_critic2: CriticModel,
+                 td3_critic_model1: CriticModel,
+                 td3_critic_model2: CriticModel,
                  target_actor: ActorModel,
-                 critic_model: CriticModel,
                  actor_model: ActorModel,
                  critic_model_input_concat: Callable[[OptionalSeqTensors, OptionalSeqTensors],
                  OptionalSeqTensors]):
         """
         Инициализация
-        :param target_critic: Целевая модель критика
+        :param td3_target_critic1: Целевая модель критика #1 для реализации Twin Delayed DDPG (TD3)
+        :param td3_target_critic2: Целевая модель критика #2 для реализации Twin Delayed DDPG (TD3)
+        :param td3_critic_model1: Модель критика #1 для реализации Twin Delayed DDPG (TD3)
+        :param td3_critic_model2: Модель критика #2 для реализации Twin Delayed DDPG (TD3)
         :param target_actor: Целевая модель актора
-        :param critic_model: Модель критика
         :param actor_model: Модель актора
         :param critic_model_input_concat: Функция, объединяющая тензоры состояния и тензоры действия во
         вход для модели критика. Интерфейс функции (state batch, action batch) -> critic model input batch.
         """
-        self.target_critic = target_critic
+        self.td3_target_critic1 = td3_target_critic1
+        self.td3_target_critic2 = td3_target_critic2
+        self.td3_critic_model1 = td3_critic_model1
+        self.td3_critic_model2 = td3_critic_model2
         self.target_actor = target_actor
-        self.critic_model = critic_model
         self.actor_model = actor_model
         self.critic_model_input_concat = critic_model_input_concat
+        self._learn_iter = 0
+
+    def learn(self, buffer: Buffer, batch_size: int, epochs: int,
+              q_learning_discount_factor: float,
+              target_model_update_rate: float,
+              td3_critic_optimizer1: tf.optimizers.Optimizer,
+              td3_critic_optimizer2: tf.optimizers.Optimizer,
+              actor_optimizer: Optional[tf.optimizers.Optimizer],
+              td3_target_policy_smoothing: Optional[Callable[[OptionalSeqTensors], OptionalSeqTensors]] = None,
+              td3_policy_update_delay: int = 1
+              ):
+
+        # if not enough records for batch
+        if buffer.records_count() < batch_size:
+            return
+
+        self._learn_iter += 1
+
+        for _ in range(epochs):
+            self._update_critic_model(*buffer.new_batch_records(batch_size, only_state_batch=False),
+                                      td3_critic_optimizer1=td3_critic_optimizer1,
+                                      td3_critic_optimizer2=td3_critic_optimizer2,
+                                      q_learning_discount_factor=tf.constant(q_learning_discount_factor),
+                                      td3_target_policy_smoothing=td3_target_policy_smoothing)
+
+        if self._learn_iter % td3_policy_update_delay == 0:
+            for _ in range(epochs):
+                self._update_actor_model(state_batch=buffer.new_batch_records(batch_size, only_state_batch=True),
+                                         actor_optimizer=actor_optimizer)
+
+        tensor_update_rate: Tensor = tf.constant(target_model_update_rate)
+
+        self._update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables,
+                            tensor_update_rate)
+        self._update_target(self.td3_target_critic1.trainable_variables, self.td3_critic_model1.trainable_variables,
+                            tensor_update_rate)
+        self._update_target(self.td3_target_critic2.trainable_variables, self.td3_critic_model2.trainable_variables,
+                            tensor_update_rate)
 
     def policy(self, state: OptionalSeqTensors) -> OptionalSeqTensors:
         """
@@ -183,40 +231,6 @@ class DDPG:
         :return: Action
         """
         return self.actor_model.predict(model_input=state, training=False, batch_mode=False)
-
-    # TODO добавить флаг обучения актора без значения по умолчанию (или логику, при которой оптимизатор может не передаваться).
-    #      Смысл в том, чтобы начать обучение актора только после того, как критик будет первично обучен.
-    #      Старт обучения актора должен быть позже начала обучения критика.
-    #      Иначе актор, обучаясь при еще ненастроенном критике, успевает перевести свои параметры в область со свойствами:
-    #      1) локальный оптимум
-    #      2) плато, независящее от параметров актора
-    def learn(self, buffer: Buffer, batch_size: int, epochs: int,
-              q_learning_discount_factor: float,
-              target_model_update_rate: float,
-              critic_optimizer: tf.optimizers.Optimizer,
-              actor_optimizer: tf.optimizers.Optimizer | None,
-              optimal_action: Callable[[CriticModel, OptionalSeqTensors], OptionalSeqTensors]):
-
-        # if not enough records for batch
-        if buffer.records_count() < batch_size:
-            return
-
-        for _ in range(epochs):
-            self._update_critic_model(*buffer.new_batch_records(batch_size, only_state_batch=False),
-                                      critic_optimizer=critic_optimizer,
-                                      q_learning_discount_factor=tf.constant(q_learning_discount_factor))
-
-        if actor_optimizer:
-            for _ in range(epochs):
-                self._update_actor_model(state_batch=buffer.new_batch_records(batch_size, only_state_batch=True),
-                                         actor_optimizer=actor_optimizer, optimal_action=optimal_action)
-
-        tensor_update_rate: Tensor = tf.constant(target_model_update_rate)
-        if actor_optimizer:
-            self._update_target(self.target_actor.trainable_variables, self.actor_model.trainable_variables,
-                                tensor_update_rate)
-        self._update_target(self.target_critic.trainable_variables, self.critic_model.trainable_variables,
-                            tensor_update_rate)
 
     # This update target parameters slowly
     # Based on rate target_model_update_rate, which is much less than one.
@@ -231,61 +245,79 @@ class DDPG:
     def _update_critic_model(
             self, state_batch: OptionalSeqTensors, action_batch: OptionalSeqTensors, reward_batch: Tensor,
             next_state_batch: OptionalSeqTensors,
-            critic_optimizer: tf.optimizers.Optimizer,
-            q_learning_discount_factor: Tensor
+            td3_critic_optimizer1: tf.optimizers.Optimizer,
+            td3_critic_optimizer2: tf.optimizers.Optimizer,
+            q_learning_discount_factor: Tensor,
+            td3_target_policy_smoothing: Callable[[OptionalSeqTensors], OptionalSeqTensors]
     ):
 
         # Training and updating Critic network.
-        with tf.GradientTape(watch_accessed_variables=False) as tape:
-            for t in self.critic_model.trainable_variables:
+        with tf.GradientTape(watch_accessed_variables=False, persistent=True) as tape:
+            for t in self.td3_critic_model1.trainable_variables + self.td3_critic_model2.trainable_variables:
                 tape.watch(t)
 
             target_actions = self.target_actor.predict(next_state_batch, training=False)
-            y = reward_batch + q_learning_discount_factor * self.target_critic.predict(
-                self.critic_model_input_concat(next_state_batch, target_actions), training=False
+            if td3_target_policy_smoothing:
+                target_actions = td3_target_policy_smoothing(target_actions)
+
+            critic_input = self.critic_model_input_concat(next_state_batch, target_actions)
+            td3_next_reward = tf.math.minimum(
+                self.td3_target_critic1.predict(model_input=critic_input, training=False),
+                self.td3_target_critic2.predict(model_input=critic_input, training=False)
             )
-            critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
-                                                     training=True)
-            critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
 
-        grads_and_vars = critic_optimizer.compute_gradients(loss=critic_loss,
-                                                            var_list=self.critic_model.trainable_variables,
-                                                            tape=tape)
+            y = reward_batch + q_learning_discount_factor * td3_next_reward
 
-        def optimal_learning_rate() -> float:
+            critic_input = self.critic_model_input_concat(state_batch, action_batch)
+            critic_value1 = self.td3_critic_model1.predict(model_input=critic_input, training=True)
+            critic_value2 = self.td3_critic_model2.predict(model_input=critic_input, training=True)
+            critic_loss1 = tf.math.reduce_mean(tf.math.square(y - critic_value1))
+            critic_loss2 = tf.math.reduce_mean(tf.math.square(y - critic_value2))
+
+        grads_and_vars1 = td3_critic_optimizer1.compute_gradients(loss=critic_loss1,
+                                                                  var_list=self.td3_critic_model1.trainable_variables,
+                                                                  tape=tape)
+        grads_and_vars2 = td3_critic_optimizer2.compute_gradients(loss=critic_loss2,
+                                                                  var_list=self.td3_critic_model2.trainable_variables,
+                                                                  tape=tape)
+
+        def optimal_learning_rate(critic_model, grads_and_vars, critic_optimizer) -> float:
             def fun(x: float) -> float:
                 # _distribution_strategy не может клонироваться
                 strategy = critic_optimizer._distribution_strategy
                 critic_optimizer._distribution_strategy = None  # TODO сделать проверку наличия атрибута _distribution_strategy
-                optimizer = deepcopy(critic_optimizer)  # critic_optimizer.from_config(critic_optimizer.get_config())
+                optimizer = deepcopy(critic_optimizer)
                 optimizer._distribution_strategy = strategy
                 critic_optimizer._distribution_strategy = strategy
 
                 # сохраняем текущие параметры модели
-                model_weights = self.critic_model.get_weights()
+                model_weights = critic_model.get_weights()
                 optimizer.learning_rate = x
                 optimizer.apply_gradients(grads_and_vars)
-                critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
-                                                         training=False)
+                critic_value = critic_model.predict(self.critic_model_input_concat(state_batch, action_batch),
+                                                    training=False)
                 critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
                 # восстанавливаем параметры модели
-                self.critic_model.set_weights(model_weights)
+                critic_model.set_weights(model_weights)
                 return critic_loss.numpy()
 
-            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
-            # r = minimize_scalar(fun=fun, bracket=[1E-4, 1E-2], method="brent", tol=1E-3, options={"maxiter": 30})
+            r = minimize_scalar(fun=fun,
+                                bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
 
             return r.x
 
-        critic_optimizer.learning_rate = optimal_learning_rate()
-        critic_optimizer.apply_gradients(grads_and_vars)
-        # critic_optimizer.minimize(loss=critic_loss, var_list=self.critic_model.trainable_variables, tape=tape)
+        td3_critic_optimizer1.learning_rate = optimal_learning_rate(
+            critic_model=self.td3_critic_model1, grads_and_vars=grads_and_vars1, critic_optimizer=td3_critic_optimizer1)
+        td3_critic_optimizer1.apply_gradients(grads_and_vars1)
+
+        td3_critic_optimizer2.learning_rate = optimal_learning_rate(
+            critic_model=self.td3_critic_model2, grads_and_vars=grads_and_vars2, critic_optimizer=td3_critic_optimizer2)
+        td3_critic_optimizer2.apply_gradients(grads_and_vars2)
 
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer,
-                            optimal_action: Callable[[CriticModel, OptionalSeqTensors], OptionalSeqTensors]):
+    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer):
 
         """
         target_actions = _tensors_to_seq_tensors(optimal_action(self.critic_model, state_batch))
@@ -295,8 +327,6 @@ class DDPG:
             actor_actions = _tensors_to_seq_tensors(self.actor_model.predict(state_batch, training=True))
             actor_loss = tf.math.reduce_mean(
                 tf.math.square(tf.stack(target_actions, axis=0) - tf.stack(actor_actions, axis=0)))
-
-        actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)
         """
 
         # Training and updating Actor network.
@@ -305,8 +335,8 @@ class DDPG:
                 tape.watch(t)
 
             actions = self.actor_model.predict(state_batch, training=True)
-            critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, actions),
-                                                     training=True)
+            critic_value = self.td3_critic_model1.predict(self.critic_model_input_concat(state_batch, actions),
+                                                          training=True)
             # Used `-value` as we want to maximize the value given
             # by the critic for our actions
             actor_loss = -tf.math.reduce_mean(critic_value)
@@ -329,8 +359,8 @@ class DDPG:
                 optimizer.learning_rate = x
                 optimizer.apply_gradients(grads_and_vars)
                 actions = self.actor_model.predict(state_batch, training=False)
-                critic_value = self.critic_model.predict(self.critic_model_input_concat(state_batch, actions),
-                                                         training=False)
+                critic_value = self.td3_critic_model1.predict(self.critic_model_input_concat(state_batch, actions),
+                                                              training=False)
                 # Used `-value` as we want to maximize the value given
                 # by the critic for our actions
                 actor_loss = -tf.math.reduce_mean(critic_value)
@@ -338,7 +368,7 @@ class DDPG:
                 self.actor_model.set_weights(model_weights)
                 return actor_loss.numpy()
 
-            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
+            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7}) # TODO bounds, tol и maxiter для learning rate search сделать входными параметрами в виде dict. Если не указано, то используется learning rate из оптимизатора.
             # r = minimize_scalar(fun=fun, bracket=[1E-4, 1E-2], method="brent", tol=1E-3, options={"maxiter": 30})
 
             return r.x
