@@ -7,7 +7,8 @@ https://github.com/keras-team/keras-io/blob/master/examples/rl/ddpg_pendulum.py
 https://colab.research.google.com/github/keras-team/keras-io/blob/master/examples/rl/ipynb/ddpg_pendulum.ipynb
 """
 import collections.abc
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Any, List
 from copy import deepcopy
 
 import numpy as np
@@ -153,6 +154,14 @@ class Buffer:
         return min(self.buffer_counter, self.buffer_capacity)
 
 
+@dataclass(frozen=True)
+class LearningRateSearchOptions:
+    bounds_lower: float
+    bounds_upper: float
+    max_iterations: int
+    tol: float
+
+
 class TwinDelayedDDPG:
     """
     Реализация Twin Delayed DDPG (другое наименование TD3)
@@ -194,7 +203,8 @@ class TwinDelayedDDPG:
               td3_critic_optimizer2: tf.optimizers.Optimizer,
               actor_optimizer: Optional[tf.optimizers.Optimizer],
               td3_target_policy_smoothing: Optional[Callable[[OptionalSeqTensors], OptionalSeqTensors]] = None,
-              td3_policy_update_delay: int = 1
+              td3_policy_update_delay: int = 1,
+              learning_rate_search_options: Optional[LearningRateSearchOptions] = None
               ):
 
         # if not enough records for batch
@@ -208,12 +218,14 @@ class TwinDelayedDDPG:
                                       td3_critic_optimizer1=td3_critic_optimizer1,
                                       td3_critic_optimizer2=td3_critic_optimizer2,
                                       q_learning_discount_factor=tf.constant(q_learning_discount_factor),
-                                      td3_target_policy_smoothing=td3_target_policy_smoothing)
+                                      td3_target_policy_smoothing=td3_target_policy_smoothing,
+                                      learning_rate_search_options=learning_rate_search_options)
 
         if self._learn_iter % td3_policy_update_delay == 0:
             for _ in range(epochs):
                 self._update_actor_model(state_batch=buffer.new_batch_records(batch_size, only_state_batch=True),
-                                         actor_optimizer=actor_optimizer)
+                                         actor_optimizer=actor_optimizer,
+                                         learning_rate_search_options=learning_rate_search_options)
 
         tensor_update_rate: Tensor = tf.constant(target_model_update_rate)
 
@@ -248,7 +260,8 @@ class TwinDelayedDDPG:
             td3_critic_optimizer1: tf.optimizers.Optimizer,
             td3_critic_optimizer2: tf.optimizers.Optimizer,
             q_learning_discount_factor: Tensor,
-            td3_target_policy_smoothing: Callable[[OptionalSeqTensors], OptionalSeqTensors]
+            td3_target_policy_smoothing: Callable[[OptionalSeqTensors], OptionalSeqTensors],
+            learning_rate_search_options: Optional[LearningRateSearchOptions] = None
     ):
 
         # Training and updating Critic network.
@@ -302,22 +315,36 @@ class TwinDelayedDDPG:
                 return critic_loss.numpy()
 
             r = minimize_scalar(fun=fun,
-                                bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7})
+                                bounds=[learning_rate_search_options.bounds_lower,
+                                        learning_rate_search_options.bounds_upper],
+                                method="bounded",
+                                options={
+                                    "maxiter": learning_rate_search_options.max_iterations,
+                                    "xatol": learning_rate_search_options.tol
+                                })
 
             return r.x
 
-        td3_critic_optimizer1.learning_rate = optimal_learning_rate(
-            critic_model=self.td3_critic_model1, grads_and_vars=grads_and_vars1, critic_optimizer=td3_critic_optimizer1)
-        td3_critic_optimizer1.apply_gradients(grads_and_vars1)
+        if learning_rate_search_options:
+            td3_critic_optimizer1.learning_rate = optimal_learning_rate(
+                critic_model=self.td3_critic_model1,
+                grads_and_vars=grads_and_vars1,
+                critic_optimizer=td3_critic_optimizer1)
 
-        td3_critic_optimizer2.learning_rate = optimal_learning_rate(
-            critic_model=self.td3_critic_model2, grads_and_vars=grads_and_vars2, critic_optimizer=td3_critic_optimizer2)
+            td3_critic_optimizer2.learning_rate = optimal_learning_rate(
+                critic_model=self.td3_critic_model2, grads_and_vars=grads_and_vars2,
+                critic_optimizer=td3_critic_optimizer2)
+
+        td3_critic_optimizer1.apply_gradients(grads_and_vars1)
         td3_critic_optimizer2.apply_gradients(grads_and_vars2)
 
     # Eager execution is turned on by default in TensorFlow 2. Decorating with tf.function allows
     # TensorFlow to build a static graph out of the logic and computations in our function.
     # This provides a large speed up for blocks of code that contain many small TensorFlow operations such as this one.
-    def _update_actor_model(self, state_batch: OptionalSeqTensors, actor_optimizer: tf.optimizers.Optimizer):
+    def _update_actor_model(self,
+                            state_batch: OptionalSeqTensors,
+                            actor_optimizer: tf.optimizers.Optimizer,
+                            learning_rate_search_options: Optional[LearningRateSearchOptions] = None):
 
         """
         target_actions = _tensors_to_seq_tensors(optimal_action(self.critic_model, state_batch))
@@ -368,11 +395,19 @@ class TwinDelayedDDPG:
                 self.actor_model.set_weights(model_weights)
                 return actor_loss.numpy()
 
-            r = minimize_scalar(fun=fun, bounds=[1E-7, 1E-2], method="bounded", options={"maxiter": 30, "xatol": 1E-7}) # TODO bounds, tol и maxiter для learning rate search сделать входными параметрами в виде dict. Если не указано, то используется learning rate из оптимизатора.
+            r = minimize_scalar(fun=fun,
+                                bounds=[learning_rate_search_options.bounds_lower,
+                                        learning_rate_search_options.bounds_upper],
+                                method="bounded",
+                                options={
+                                    "maxiter": learning_rate_search_options.max_iterations,
+                                    "xatol": learning_rate_search_options.tol
+                                })
             # r = minimize_scalar(fun=fun, bracket=[1E-4, 1E-2], method="brent", tol=1E-3, options={"maxiter": 30})
 
             return r.x
 
-        actor_optimizer.learning_rate = optimal_learning_rate()
+        if learning_rate_search_options:
+            actor_optimizer.learning_rate = optimal_learning_rate()
         actor_optimizer.apply_gradients(grads_and_vars)
         # actor_optimizer.minimize(loss=actor_loss, var_list=self.actor_model.trainable_variables, tape=tape)

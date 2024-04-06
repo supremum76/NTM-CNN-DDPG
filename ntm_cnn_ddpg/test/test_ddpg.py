@@ -17,7 +17,7 @@ from keras.optimizers import Optimizer
 from ntm_cnn_ddpg.cnn.model import Tensor, Model, ActorModel as DDPGActorModel, CriticModel as DDPGCriticModel, \
     OptionalSeqTensors
 from ntm_cnn_ddpg.cnn.model2d import Model2D, concat_input_tensors
-from ntm_cnn_ddpg.ddpg.twindelayedddpg import Buffer, TwinDelayedDDPG, OUActionNoise
+from ntm_cnn_ddpg.ddpg.twindelayedddpg import Buffer, TwinDelayedDDPG, OUActionNoise, LearningRateSearchOptions
 from ntm_cnn_ddpg.ntm.controller.memory_bank import MemoryBank
 
 
@@ -693,14 +693,14 @@ class TestDDPG(TestCase):
         tf.config.threading.set_inter_op_parallelism_threads(cpu_count)
         tf.config.threading.set_intra_op_parallelism_threads(cpu_count)
 
-        base_block = [0] * 1 + [1] * 1  # [0] * 5 + [1] * 5
+        base_block = [0] * 4 + [1] * 4  # [0] * 5 + [1] * 5
         random.shuffle(base_block)
         base_block_length: int = len(base_block)
         # История бинарной последовательности ограниченным окном.
         # Проверяем, что LSTM способна прогнозировать такие последовательности.
-        sequence_history_window: collections.deque = collections.deque([], base_block_length * 10)
-        sequence_history_window_extended: collections.deque = collections.deque([], base_block_length * 10)
-        lstm_units: int = int(base_block_length * 1.0)  # base_block_length * 2; 0.5 - нет обучения
+        sequence_history_window: collections.deque = collections.deque([], base_block_length * 2)
+        sequence_history_window_extended: collections.deque = collections.deque([], base_block_length * 2)
+        lstm_units: int = int(base_block_length * 1.0)  # 1.0
         lstm_dropout: float = 0.0
         batch_size: int = 20 * base_block_length
         td3_policy_update_delay = 5 * base_block_length
@@ -708,6 +708,13 @@ class TestDDPG(TestCase):
 
         actor_output_length: int = (
             2  # прогноз последовательности (0 или 1)
+        )
+
+        learning_rate_search_options = LearningRateSearchOptions(
+            bounds_lower=1E-4,
+            bounds_upper=1E-2,
+            max_iterations=5,
+            tol=1E-4
         )
 
         @tf.function
@@ -965,13 +972,14 @@ class TestDDPG(TestCase):
             ddpg.learn(buffer=buffer,
                        batch_size=batch_size,
                        epochs=1,
-                       q_learning_discount_factor=0.9,
+                       q_learning_discount_factor=0.1,
                        target_model_update_rate=0.001,
                        td3_critic_optimizer1=td3_critic_optimizer1,
                        td3_critic_optimizer2=td3_critic_optimizer2,
                        actor_optimizer=actor_optimizer,
                        td3_target_policy_smoothing=td3_target_policy_smoothing,
-                       td3_policy_update_delay=td3_policy_update_delay
+                       td3_policy_update_delay=td3_policy_update_delay,
+                       learning_rate_search_options=learning_rate_search_options
                        )
 
             step += 1
@@ -987,7 +995,7 @@ class TestDDPG(TestCase):
 
                 history_accuracy.append(accuracy / 100)
                 accuracy = 0
-                stat_window_len: int = 20
+                stat_window_len: int = 10 * base_block_length
                 # останавливаемся, если достигли предела качества управления
                 if step > 2 * stat_window_len * 100:
                     if not (sum(history_avg_reward[len(history_avg_reward) - stat_window_len:]) >
